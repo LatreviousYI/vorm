@@ -50,6 +50,9 @@ class _TestDialect(AbstractDialect):
     def map_python_type(self, annotation: Any, column_info: Any) -> str:
         return "INTEGER"
 
+    async def introspect_indexes(self, table_name: str) -> set[str]:
+        return set()
+
     async def introspect_columns(self, table_name: str) -> dict[str, Any]:
         return {}
 
@@ -156,3 +159,73 @@ async def test_dialect_with_owns_pool_closes_pool() -> None:
     assert dialect.closed is False
     await dialect.close()
     assert dialect.closed is True
+
+
+# ---------------------------------------------------------------------------
+# 断连重试
+# ---------------------------------------------------------------------------
+
+
+class _FlakyDialect(_TestDialect):
+    """用于测试 ``_retry_on_connection_error`` 的方言。
+
+    对 ``_is_connection_error`` 识别的错误执行重试。
+    """
+
+    def __init__(self, pool: object, *, fail_times: int = 2) -> None:
+        super().__init__(pool)
+        self.fail_times = fail_times
+        self.call_count = 0
+        self.closed = False
+
+    @staticmethod
+    def _is_connection_error(exc: Exception) -> bool:
+        return isinstance(exc, RuntimeError) and "connection" in str(exc).lower()
+
+
+async def test_retry_on_connection_error_recovers() -> None:
+    """前 2 次失败第三次成功，应返回正确结果。"""
+    fail_times = 2
+
+    async def flaky_callable() -> int:
+        nonlocal fail_times
+        fail_times -= 1
+        if fail_times >= 0:
+            raise RuntimeError("connection lost")
+        return 42
+
+    dialect = _FlakyDialect(object())
+    result = await dialect._retry_on_connection_error(flaky_callable)
+    assert result == 42
+
+
+async def test_retry_exhausted_raises() -> None:
+    """连续多次失败（超过 3 次重试上限），应抛出异常。"""
+    call_count = 0
+
+    async def always_fail() -> int:
+        nonlocal call_count
+        call_count += 1
+        raise RuntimeError("connection lost")
+
+    dialect = _FlakyDialect(object())
+    with pytest.raises(RuntimeError, match="connection"):
+        await dialect._retry_on_connection_error(always_fail)
+    # 初始 1 次 + 3 次重试 = 4 次
+    assert call_count == 4
+
+
+async def test_non_connection_error_skips_retry() -> None:
+    """非连接错误不应重试，直接抛出。"""
+    call_count = 0
+
+    async def raise_value_error() -> int:
+        nonlocal call_count
+        call_count += 1
+        raise ValueError("not a connection error")
+
+    dialect = _FlakyDialect(object())
+    with pytest.raises(ValueError, match="not a connection error"):
+        await dialect._retry_on_connection_error(raise_value_error)
+    # 只调了 1 次，没有重试
+    assert call_count == 1

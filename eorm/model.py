@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from pydantic import BaseModel, ConfigDict
 
+from eorm.ddl import Index
 from eorm.exceptions import ModelDefinitionError
 from eorm.expression import Column
 from eorm.fields import ColumnInfo, get_column_info
@@ -49,6 +50,22 @@ class ModelMeta(ModelMetaclass):
         cls.__column_info__ = column_info
         cls.__pk__ = pk_name
 
+        # -- 索引 -------------------------------------------------------
+        indexes: list[Index] = []
+
+        # Meta.indexes 声明的联合索引
+        meta_indexes = getattr(meta, "indexes", None) or []
+        for idx in meta_indexes:
+            if isinstance(idx, Index):
+                indexes.append(idx)
+
+        # Field(index=True) 单列索引 → 自动转为 Index
+        for field_name, info in column_info.items():
+            if info.index and not info.unique:  # unique 已生成 UNIQUE 约束，跳过
+                indexes.append(Index(fields=(field_name,), unique=False))
+
+        cls.__indexes__ = indexes
+
         return cls
 
     def __getattribute__(cls, name: str) -> Any:
@@ -70,6 +87,7 @@ class Model(BaseModel, metaclass=ModelMeta):
     __columns__: ClassVar[dict[str, Column]]
     __column_info__: ClassVar[dict[str, ColumnInfo]]
     __pk__: ClassVar[str | None]
+    __indexes__: ClassVar[list[Index]]
 
     @classmethod
     def table_name(cls) -> str:
@@ -93,37 +111,35 @@ class Model(BaseModel, metaclass=ModelMeta):
         """创建或同步数据库表（只增改不删）。
 
         表不存在时执行 ``CREATE TABLE IF NOT EXISTS``；
-        表存在时为新增字段合并为一条 ``ALTER TABLE ADD COLUMN``；
-        已有列若类型或 null 约束变化则生成对应的修改语句。
-        永不删除列或表。
+        表存在时为新增字段和修改列合并为一条 ``ALTER TABLE``；
+        随后同步缺失的索引（``CREATE INDEX``，只增不删）。
+        永不删除列、表或索引。
         """
         existing = await dialect.introspect_columns(cls.__table__)
 
         if not existing:
             sql = dialect.build_create_table(cls)
             await dialect.execute(sql, [])
-            return
+        else:
+            # 收集新增列和待修改列
+            missing: list[str] = []
+            modified: list[tuple[str, Any]] = []  # (field_name, IntrospectedColumn)
+            pk_name = cls.__pk__
 
-        # 收集新增列和待修改列
-        missing: list[str] = []
-        modified: list[tuple[str, object]] = []  # (field_name, IntrospectedColumn)
-        pk_name = cls.__pk__
+            for field_name, info in cls.__column_info__.items():
+                expected_name = (info.column_name or field_name).lower()
+                matched = existing.get(expected_name)
+                if matched is None:
+                    missing.append(field_name)
+                elif field_name != pk_name:
+                    modified.append((field_name, matched))
 
-        for field_name, info in cls.__column_info__.items():
-            expected_name = (info.column_name or field_name).lower()
-            # 按字段名在 existing 中查找（大小写不敏感）
-            matched = existing.get(expected_name)
-            if matched is None:
-                missing.append(field_name)
-            elif field_name != pk_name:
-                # PK 列属于结构性约束，不参与字段属性修改
-                modified.append((field_name, matched))
+            if missing or modified:
+                sql = dialect.build_sync_alter(cls, missing, modified)
+                if sql:
+                    await dialect.execute(sql, [])
 
-        if missing:
-            sql = dialect.build_add_columns(cls, missing)
+        # -- 索引同步（只增不删） --
+        existing_indexes = await dialect.introspect_indexes(cls.__table__)
+        for sql in dialect.build_sync_indexes(cls, existing_indexes):
             await dialect.execute(sql, [])
-
-        if modified:
-            sql = dialect.build_modify_columns(cls, modified)
-            if sql:
-                await dialect.execute(sql, [])

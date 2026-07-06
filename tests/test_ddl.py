@@ -6,7 +6,7 @@ from typing import Any
 import pytest
 
 from eorm import Field, Model, Session
-from eorm.ddl import IntrospectedColumn
+from eorm.ddl import Index, IntrospectedColumn
 from eorm.dialects.base import AbstractDialect
 from eorm.fields import ColumnInfo
 
@@ -69,7 +69,7 @@ class DDLDialect(AbstractDialect):
         elif base is str:
             if column_info.max_length is not None:
                 return f"VARCHAR({column_info.max_length})"
-            return "VARCHAR(255)"
+            return "TEXT"
         elif base is bool:
             return "BOOLEAN"
         elif base is float:
@@ -84,6 +84,9 @@ class DDLDialect(AbstractDialect):
             return "JSONB"
         return "TEXT"
 
+    async def introspect_indexes(self, table_name: str) -> set[str]:
+        return set()
+
     async def introspect_columns(self, table_name: str) -> dict[str, IntrospectedColumn]:
         return {}
 
@@ -94,8 +97,10 @@ class RecordingDDLDialect(DDLDialect):
     def __init__(
         self,
         introspect_result: dict[str, IntrospectedColumn] | None = None,
+        introspect_indexes: set[str] | None = None,
     ) -> None:
         self._introspect_result = introspect_result or {}
+        self._introspect_indexes = introspect_indexes or set()
         self.executed_sqls: list[str] = []
         self.last_sql: str = ""
         self.last_params: list[Any] = []
@@ -105,6 +110,9 @@ class RecordingDDLDialect(DDLDialect):
         self.last_params = params
         self.executed_sqls.append(sql)
         return None
+
+    async def introspect_indexes(self, table_name: str) -> set[str]:
+        return self._introspect_indexes
 
     async def introspect_columns(self, table_name: str) -> dict[str, IntrospectedColumn]:
         return self._introspect_result
@@ -159,7 +167,7 @@ def test_build_create_table_basic(dialect: DDLDialect) -> None:
     assert 'CREATE TABLE IF NOT EXISTS "users"' in sql
     assert '"id" SERIAL PRIMARY KEY' in sql
     assert '"name" VARCHAR(100) NOT NULL' in sql
-    assert '"email" VARCHAR(255)' in sql
+    assert '"email" TEXT' in sql
     assert '"is_active" BOOLEAN' in sql
 
 
@@ -311,7 +319,7 @@ def test_build_create_table_custom_column_name(dialect: DDLDialect) -> None:
         py_name: str = Field(column_name="db_name")
 
     sql = dialect.build_create_table(Renamed)
-    assert '"db_name" VARCHAR(255)' in sql
+    assert '"db_name" TEXT' in sql
     assert '"py_name"' not in sql
 
 
@@ -321,7 +329,7 @@ def test_build_create_table_multiple_columns(dialect: DDLDialect) -> None:
 
     assert '"id" SERIAL PRIMARY KEY' in sql
     assert '"title" VARCHAR(200)' in sql
-    assert '"body" VARCHAR(255)' in sql
+    assert '"body" TEXT' in sql
     assert '"view_count" INTEGER' in sql
     assert '"price" DOUBLE PRECISION' in sql
 
@@ -359,7 +367,7 @@ def test_build_add_column_custom_name(dialect: DDLDialect) -> None:
         py_name: str = Field(column_name="db_name")
 
     sql = dialect.build_add_column(Renamed, "py_name")
-    assert '"db_name" VARCHAR(255)' in sql
+    assert '"db_name" TEXT' in sql
 
 
 def test_build_add_columns_multiple(dialect: DDLDialect) -> None:
@@ -419,7 +427,7 @@ async def test_sync_table_noop_when_all_columns_exist() -> None:
     existing = {
         "id": IntrospectedColumn("id", "serial", is_nullable=False),
         "name": IntrospectedColumn("name", "varchar(100)", is_nullable=False),
-        "email": IntrospectedColumn("email", "varchar(255)", is_nullable=True),
+        "email": IntrospectedColumn("email", "text", is_nullable=True),
         "age": IntrospectedColumn("age", "integer", is_nullable=True),
         # User.is_active 默认 nullable=True，DB 也应是 True
         "is_active": IntrospectedColumn("is_active", "boolean", is_nullable=True),
@@ -575,9 +583,139 @@ async def test_sync_table_new_columns_and_modifications_combined() -> None:
 
     await User.sync_table(session.dialect)
 
-    # 至少应有：1 条 MODIFY（name）+ 1 条 ADD COLUMN（email, age, is_active）
-    assert len(dialect.executed_sqls) >= 2
-    has_add = any("ADD COLUMN" in s for s in dialect.executed_sqls)
-    has_modify = any(("ALTER COLUMN" in s or "MODIFY" in s) for s in dialect.executed_sqls)
-    assert has_add
-    assert has_modify
+    # ADD 和 MODIFY 应合并为一条 ALTER TABLE
+    assert len(dialect.executed_sqls) == 1
+    sql = dialect.executed_sqls[0]
+    assert "ADD COLUMN" in sql
+    assert "ALTER COLUMN" in sql or "MODIFY" in sql
+
+
+# ---------------------------------------------------------------------------
+# 索引测试
+# ---------------------------------------------------------------------------
+
+
+class IndexedModel(Model):
+    """带联合索引的模型。"""
+
+    class Meta:
+        table = "indexed"
+        indexes = [
+            Index(fields=("name", "age")),  # 联合普通索引
+            Index(fields=("email",), unique=True),  # 唯一索引
+            Index(fields=("name", "age", "status"), name="idx_custom"),
+        ]
+
+    id: int = Field(primary_key=True, auto_increment=True)
+    name: str = Field(max_length=100, nullable=False)
+    age: int
+    email: str = Field(max_length=255)
+    status: str = Field(max_length=20)
+
+
+def test_index_name_auto_generation() -> None:
+    """未指定 name 时自动生成 ix_{table}_{fields} 或 unq_{table}_{fields}。"""
+    ix = Index(fields=("name", "age"))
+    assert ix.index_name("indexed") == "ix_indexed_name_age"
+
+    unq = Index(fields=("email",), unique=True)
+    assert unq.index_name("indexed") == "unq_indexed_email"
+
+    named = Index(fields=("a", "b"), name="my_idx")
+    assert named.index_name("indexed") == "my_idx"
+
+
+def test_build_sync_indexes_generates_all_when_none_exist(dialect: DDLDialect) -> None:
+    """数据库中无任何索引时，应生成所有索引的 CREATE 语句。"""
+    sqls = dialect.build_sync_indexes(IndexedModel, existing_names=set())
+    assert len(sqls) == 3
+
+    # 普通联合索引
+    assert any("ix_indexed_name_age" in s for s in sqls)
+    assert any("CREATE INDEX" in s and "UNIQUE" not in s for s in sqls)
+    # 唯一索引
+    assert any("unq_indexed_email" in s for s in sqls)
+    assert any("CREATE UNIQUE INDEX" in s for s in sqls)
+    # 自定义名
+    assert any("idx_custom" in s for s in sqls)
+
+
+def test_build_sync_indexes_skips_existing(dialect: DDLDialect) -> None:
+    """已有索引应被跳过，不重复生成。"""
+    existing = {"ix_indexed_name_age", "unq_indexed_email"}
+    sqls = dialect.build_sync_indexes(IndexedModel, existing_names=existing)
+    assert len(sqls) == 1
+    assert "idx_custom" in sqls[0]
+
+
+async def test_sync_table_creates_indexes() -> None:
+    """sync_table 应在建表后创建缺失的索引。"""
+    existing_cols = {
+        "id": IntrospectedColumn("id", "serial", is_nullable=False),
+        "name": IntrospectedColumn("name", "varchar(100)", is_nullable=False),
+        "age": IntrospectedColumn("age", "integer", is_nullable=True),
+        "email": IntrospectedColumn("email", "varchar(255)", is_nullable=True),
+        "status": IntrospectedColumn("status", "varchar(20)", is_nullable=True),
+    }
+    dialect = RecordingDDLDialect(
+        introspect_result=existing_cols,
+        introspect_indexes=set(),  # 无已有索引
+    )
+    session = Session(dialect)
+
+    await IndexedModel.sync_table(session.dialect)
+
+    # ALTER TABLE（列已全匹配，无变更）+ 3 条 CREATE INDEX
+    assert len(dialect.executed_sqls) == 3
+    # 全部是 CREATE INDEX
+    assert all("CREATE" in s and "INDEX" in s for s in dialect.executed_sqls)
+
+
+async def test_sync_table_skips_existing_indexes() -> None:
+    """已有索引不应被重复创建。"""
+    dialect = RecordingDDLDialect(
+        introspect_result={
+            "id": IntrospectedColumn("id", "serial", is_nullable=False),
+            "name": IntrospectedColumn("name", "varchar(100)", is_nullable=False),
+            "age": IntrospectedColumn("age", "integer", is_nullable=True),
+            "email": IntrospectedColumn("email", "varchar(255)", is_nullable=True),
+            "status": IntrospectedColumn("status", "varchar(20)", is_nullable=True),
+        },
+        introspect_indexes={  # 3 个已存在 1 个缺失
+            "ix_indexed_name_age",
+            "unq_indexed_email",
+            "idx_custom",
+        },
+    )
+    session = Session(dialect)
+
+    await IndexedModel.sync_table(session.dialect)
+    # 无新增列、无类型变化、无缺失索引 → 0 条 SQL
+    assert len(dialect.executed_sqls) == 0
+
+
+class FieldIndexModel(Model):
+    """使用 Field(index=True) 声明单列索引。"""
+
+    class Meta:
+        table = "field_index"
+
+    id: int = Field(primary_key=True, auto_increment=True)
+    name: str = Field(max_length=50)
+    email: str = Field(index=True, max_length=255)
+
+
+def test_field_index_becomes_auto_index() -> None:
+    """Field(index=True) 应自动生成 Index 对象。"""
+    indexes = FieldIndexModel.__indexes__
+    assert len(indexes) == 1
+    assert indexes[0].fields == ("email",)
+    assert indexes[0].unique is False
+    assert indexes[0].index_name("field_index") == "ix_field_index_email"
+
+
+def test_build_sync_indexes_for_field_index(dialect: DDLDialect) -> None:
+    """Field(index=True) 的索引应出现在 CREATE INDEX 中。"""
+    sqls = dialect.build_sync_indexes(FieldIndexModel, existing_names=set())
+    assert len(sqls) == 1
+    assert "ix_field_index_email" in sqls[0]

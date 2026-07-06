@@ -51,6 +51,22 @@ class Session:
         sql, params = self.dialect.build_delete(instance)
         await self.dialect.execute(sql, params)
 
+    # -- 原生 SQL -----------------------------------------------------------
+
+    async def execute_raw(self, sql: str, params: list[Any] | None = None) -> Any:
+        """执行任意写操作（INSERT / UPDATE / DELETE / DDL），返回受影响行数。"""
+        return await self.dialect.execute(sql, params or [])
+
+    async def fetch_raw(self, sql: str, params: list[Any] | None = None) -> list[dict[str, Any]]:
+        """执行任意 SELECT 查询，返回行字典列表。"""
+        return await self.dialect.fetch(sql, params or [])
+
+    async def fetch_one_raw(
+        self, sql: str, params: list[Any] | None = None
+    ) -> dict[str, Any] | None:
+        """执行任意 SELECT 查询，返回单行字典或 None。"""
+        return await self.dialect.fetchrow(sql, params or [])
+
     # -- 事务 ---------------------------------------------------------------
 
     @asynccontextmanager

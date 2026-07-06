@@ -110,6 +110,22 @@ class PostgreSQLDialect(AbstractDialect):
 
     # -- 执行 ---------------------------------------------------------------
 
+    @staticmethod
+    def _is_connection_error(exc: Exception) -> bool:
+        """PostgreSQL 连接断开类错误。"""
+        try:
+            import asyncpg.exceptions as pg_exc
+        except ImportError:
+            return False
+        return isinstance(
+            exc,
+            (
+                pg_exc.ConnectionDoesNotExistError,
+                pg_exc.ConnectionFailureError,
+                pg_exc.InterfaceError,
+            ),
+        )
+
     def build_insert(self, instance: Model) -> tuple[str, list[Any]]:
         sql, params = super().build_insert(instance)
         pk_col = type(instance).primary_key_column()
@@ -125,29 +141,38 @@ class PostgreSQLDialect(AbstractDialect):
 
     async def execute(self, sql: str, params: list[Any]) -> Any:
         """执行写操作，INSERT 返回 lastrowid，其他返回受影响行数。"""
-        if self._tx_conn is not None:
-            return await _run_and_parse(self._tx_conn, sql, params)
-        else:
-            async with self.pool.acquire() as conn:
-                return await _run_and_parse(conn, sql, params)
+        async def _do() -> Any:
+            if self._tx_conn is not None:
+                return await _run_and_parse(self._tx_conn, sql, params)
+            else:
+                async with self.pool.acquire() as conn:
+                    return await _run_and_parse(conn, sql, params)
+
+        return await self._retry_on_connection_error(_do)
 
     async def fetch(self, sql: str, params: list[Any]) -> list[dict[str, Any]]:
-        if self._tx_conn is not None:
-            rows = await self._tx_conn.fetch(sql, *params)
-            return [dict(row) for row in rows]
-        else:
-            async with self.pool.acquire() as conn:
-                rows = await conn.fetch(sql, *params)
+        async def _do() -> list[dict[str, Any]]:
+            if self._tx_conn is not None:
+                rows = await self._tx_conn.fetch(sql, *params)
                 return [dict(row) for row in rows]
+            else:
+                async with self.pool.acquire() as conn:
+                    rows = await conn.fetch(sql, *params)
+                    return [dict(row) for row in rows]
+
+        return await self._retry_on_connection_error(_do)
 
     async def fetchrow(self, sql: str, params: list[Any]) -> dict[str, Any] | None:
-        if self._tx_conn is not None:
-            row = await self._tx_conn.fetchrow(sql, *params)
-            return dict(row) if row is not None else None
-        else:
-            async with self.pool.acquire() as conn:
-                row = await conn.fetchrow(sql, *params)
+        async def _do() -> dict[str, Any] | None:
+            if self._tx_conn is not None:
+                row = await self._tx_conn.fetchrow(sql, *params)
                 return dict(row) if row is not None else None
+            else:
+                async with self.pool.acquire() as conn:
+                    row = await conn.fetchrow(sql, *params)
+                    return dict(row) if row is not None else None
+
+        return await self._retry_on_connection_error(_do)
 
     async def close(self) -> None:
         if self._tx_conn is not None:
@@ -171,7 +196,7 @@ class PostgreSQLDialect(AbstractDialect):
         elif base is str:
             if column_info.max_length is not None:
                 return f"VARCHAR({column_info.max_length})"
-            return "VARCHAR(255)"
+            return "TEXT"
         elif base is bool:
             return "BOOLEAN"
         elif base is float:
@@ -210,6 +235,14 @@ class PostgreSQLDialect(AbstractDialect):
             )
             result[col.column_name.lower()] = col
         return result
+
+    async def introspect_indexes(self, table_name: str) -> set[str]:
+        query = "SELECT indexname FROM pg_indexes WHERE tablename = $1"
+        rows = await self.fetch(query, [table_name])
+        names = {r["indexname"] for r in rows}
+        # PG 自动为主键创建的索引（通常叫 <table>_pkey）
+        names.discard(f"{table_name}_pkey")
+        return names
 
 
 async def create_postgresql_dialect(**kwargs: Any) -> PostgreSQLDialect:

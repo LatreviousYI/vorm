@@ -5,6 +5,23 @@ from dataclasses import dataclass
 from typing import Any
 
 
+@dataclass(frozen=True)
+class Index:
+    """索引定义，在 ``Meta.indexes`` 中声明。"""
+
+    fields: tuple[str, ...]  # Python 属性名
+    unique: bool = False
+    name: str | None = None  # None → 自动生成
+
+    def index_name(self, table: str) -> str:
+        """自动生成或返回显式索引名。"""
+        if self.name is not None:
+            return self.name
+        prefix = "unq" if self.unique else "ix"
+        fields_part = "_".join(self.fields)
+        return f"{prefix}_{table}_{fields_part}"
+
+
 @dataclass
 class IntrospectedColumn:
     """Mirrors a single column row from INFORMATION_SCHEMA.COLUMNS."""

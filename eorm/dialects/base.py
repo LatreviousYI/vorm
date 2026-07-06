@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import datetime as _dt
 import json as _json_mod
 from abc import ABC, abstractmethod
@@ -87,7 +88,7 @@ class AbstractDialect(ABC):
         raise NotImplementedError
 
     # ------------------------------------------------------------------
-    # 事务
+    # 事务 & 健康检查
     # ------------------------------------------------------------------
 
     @abstractmethod
@@ -104,6 +105,40 @@ class AbstractDialect(ABC):
     async def rollback(self) -> None:
         """回滚事务。"""
         raise NotImplementedError
+
+    async def ping(self) -> bool:
+        """健康检查：执行 ``SELECT 1`` 验证连接可用。"""
+        try:
+            row = await self.fetchrow("SELECT 1 AS ok", [])
+            return row is not None and row.get("ok") == 1
+        except Exception:
+            return False
+
+    # -- 断连重试 ---------------------------------------------------------
+
+    @staticmethod
+    def _is_connection_error(_exc: Exception) -> bool:
+        """判断是否为连接错误（各方言覆盖）。默认不识别任何错误。"""
+        return False
+
+    async def _retry_on_connection_error(self, coro_factory: Any) -> Any:
+        """连接断开时自动重试（最多 3 次，指数退避）。
+
+        ``coro_factory`` 为无参可调用对象，每次重试时重新创建协程，
+        保证从连接池获取全新连接。
+        """
+        max_retries = 3
+        base_delay = 0.3
+        last_exc: Exception | None = None
+        for attempt in range(max_retries + 1):
+            try:
+                return await coro_factory()
+            except Exception as exc:
+                last_exc = exc
+                if not self._is_connection_error(exc) or attempt >= max_retries:
+                    raise
+                await asyncio.sleep(base_delay * (2**attempt))
+        raise last_exc  # type: ignore[misc]
 
     # ------------------------------------------------------------------
     # SQL 生成
@@ -461,6 +496,84 @@ class AbstractDialect(ABC):
 
         sep = ",\n  "
         return f"ALTER TABLE {table}\n  {sep.join(clauses)}"
+
+    def build_sync_alter(
+        self,
+        model: type[Model],
+        add_fields: list[str],
+        modify_pairs: list[tuple[str, IntrospectedColumn]],
+    ) -> str:
+        """生成合并 ADD COLUMN 和 MODIFY 的单个 ALTER TABLE 语句（PG 风格）。
+
+        MySQL 方言需覆盖为 ``MODIFY COLUMN`` 语法。
+        """
+        table = self.quote_identifier(model.__table__)
+        clauses: list[str] = []
+
+        # -- ADD COLUMN -------------------------------------------------
+        for field_name in add_fields:
+            column = model.__columns__[field_name]
+            info = model.__column_info__[field_name]
+            col_def = self._build_column_def(model, field_name, column, info)
+            clauses.append(f"ADD COLUMN {col_def}")
+
+        # -- MODIFY -----------------------------------------------------
+        for field_name, existing in modify_pairs:
+            column = model.__columns__[field_name]
+            info = model.__column_info__[field_name]
+            annotation = model.model_fields[field_name].annotation
+            new_type = self.map_python_type(annotation, info)
+            col_name = self.quote_identifier(column.column_name)
+
+            old_normalized = self._normalize_type(existing.data_type)
+            new_normalized = new_type.lower()
+
+            type_changed = old_normalized != new_normalized
+            null_changed = info.nullable != existing.is_nullable
+
+            if type_changed:
+                clauses.append(f"ALTER COLUMN {col_name} TYPE {new_type}")
+            if null_changed:
+                if info.nullable:
+                    clauses.append(f"ALTER COLUMN {col_name} DROP NOT NULL")
+                else:
+                    clauses.append(f"ALTER COLUMN {col_name} SET NOT NULL")
+
+        if not clauses:
+            return ""
+
+        sep = ",\n  "
+        return f"ALTER TABLE {table}\n  {sep.join(clauses)}"
+
+    # ------------------------------------------------------------------
+    # 索引
+    # ------------------------------------------------------------------
+
+    @abstractmethod
+    async def introspect_indexes(self, table_name: str) -> set[str]:
+        """返回表中已有索引的名称集合（不含主键）。"""
+        raise NotImplementedError
+
+    def build_sync_indexes(
+        self, model: type[Model], existing_names: set[str]
+    ) -> list[str]:
+        """返回仅缺失索引的 ``CREATE [UNIQUE] INDEX`` 语句列表。"""
+        table = self.quote_identifier(model.__table__)
+        result: list[str] = []
+        for idx in model.__indexes__:
+            name = idx.index_name(model.__table__)
+            if name in existing_names:
+                continue
+            cols = ", ".join(
+                self.quote_identifier(model.__columns__[f].column_name)
+                for f in idx.fields
+            )
+            unique = "UNIQUE " if idx.unique else ""
+            result.append(
+                f"CREATE {unique}INDEX {self.quote_identifier(name)} "
+                f"ON {table} ({cols})"
+            )
+        return result
 
     # ------------------------------------------------------------------
     # 执行

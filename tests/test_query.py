@@ -66,6 +66,9 @@ class ConfigurableDialect(AbstractDialect):
     def map_python_type(self, annotation: Any, column_info: Any) -> str:
         return "INTEGER"
 
+    async def introspect_indexes(self, table_name: str) -> set[str]:
+        return set()
+
     async def introspect_columns(self, table_name: str) -> dict[str, Any]:
         return {}
 
@@ -517,3 +520,63 @@ async def test_filter_between(session: Session, dialect: ConfigurableDialect) ->
     assert "BETWEEN" in dialect.last_sql
     assert 20 in dialect.last_params
     assert 40 in dialect.last_params
+
+
+# ---------------------------------------------------------------------------
+# 原生 SQL 执行
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def raw_session() -> Session:
+    return Session(ConfigurableDialect())
+
+
+async def test_execute_raw_delegates_to_dialect(raw_session: Session) -> None:
+    """execute_raw 应将 SQL 和参数透传给 dialect.execute。"""
+    raw_session.dialect.execute_result = 1
+    result = await raw_session.execute_raw("DELETE FROM users WHERE id = %s", [1])
+    assert result == 1
+
+
+async def test_fetch_raw_delegates_to_dialect(raw_session: Session) -> None:
+    """fetch_raw 应返回 dialect.fetch 的结果。"""
+    raw_session.dialect.fetch_rows = [{"id": 1, "name": "Alice"}]
+    rows = await raw_session.fetch_raw("SELECT * FROM users")
+    assert len(rows) == 1
+    assert rows[0]["name"] == "Alice"
+
+
+async def test_fetch_one_raw_delegates_to_dialect(raw_session: Session) -> None:
+    """fetch_one_raw 应返回单行或 None。"""
+    raw_session.dialect.fetchrow_result = {"id": 1}
+    row = await raw_session.fetch_one_raw("SELECT * FROM users WHERE id = 1")
+    assert row == {"id": 1}
+
+    raw_session.dialect.fetchrow_result = None
+    row = await raw_session.fetch_one_raw("SELECT * FROM users WHERE id = 999")
+    assert row is None
+
+
+# ---------------------------------------------------------------------------
+# 健康检查 (ping)
+# ---------------------------------------------------------------------------
+
+
+async def test_ping_succeeds(raw_session: Session) -> None:
+    """ping 应执行 SELECT 1 并返回 True。"""
+    raw_session.dialect.fetchrow_result = {"ok": 1}
+    ok = await raw_session.dialect.ping()
+    assert ok is True
+
+
+async def test_ping_fails_on_exception(raw_session: Session) -> None:
+    """ping 异常时应返回 False 而非抛异常。"""
+
+    class FailingDialect(ConfigurableDialect):
+        async def fetchrow(self, sql: str, params: list[Any]) -> dict[str, Any] | None:
+            raise RuntimeError("connection lost")
+
+    dialect = FailingDialect()
+    ok = await dialect.ping()
+    assert ok is False

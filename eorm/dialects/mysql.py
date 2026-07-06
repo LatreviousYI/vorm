@@ -56,54 +56,72 @@ class MySQLDialect(AbstractDialect):
 
     # -- 执行 ---------------------------------------------------------------
 
+    @staticmethod
+    def _is_connection_error(exc: Exception) -> bool:
+        """MySQL 连接断开类错误。"""
+        try:
+            from asyncmy.errors import OperationalError
+        except ImportError:
+            return False
+        return isinstance(exc, OperationalError)
+
     async def execute(self, sql: str, params: list[Any]) -> Any:
-        if self._tx_conn is not None:
-            async with self._tx_conn.cursor() as cursor:
-                await cursor.execute(sql, params)
-                return cursor.rowcount
-        else:
-            async with self.pool.acquire() as conn:
-                async with conn.cursor() as cursor:
+        async def _do() -> Any:
+            if self._tx_conn is not None:
+                async with self._tx_conn.cursor() as cursor:
                     await cursor.execute(sql, params)
-                    await conn.commit()
                     return cursor.rowcount
+            else:
+                async with self.pool.acquire() as conn:
+                    async with conn.cursor() as cursor:
+                        await cursor.execute(sql, params)
+                        await conn.commit()
+                        return cursor.rowcount
+
+        return await self._retry_on_connection_error(_do)
 
     async def execute_insert(self, sql: str, params: list[Any]) -> Any:
-        """Execute INSERT and return the generated auto-increment ID."""
-        if self._tx_conn is not None:
-            async with self._tx_conn.cursor() as cursor:
-                await cursor.execute(sql, params)
-                return cursor.lastrowid
-        else:
-            async with self.pool.acquire() as conn:
-                async with conn.cursor() as cursor:
+        async def _do() -> Any:
+            if self._tx_conn is not None:
+                async with self._tx_conn.cursor() as cursor:
                     await cursor.execute(sql, params)
-                    await conn.commit()
                     return cursor.lastrowid
+            else:
+                async with self.pool.acquire() as conn:
+                    async with conn.cursor() as cursor:
+                        await cursor.execute(sql, params)
+                        await conn.commit()
+                        return cursor.lastrowid
+
+        return await self._retry_on_connection_error(_do)
 
     async def fetch(self, sql: str, params: list[Any]) -> list[dict[str, Any]]:
-        if self._tx_conn is not None:
-            async with self._tx_conn.cursor(asyncmy.cursors.DictCursor) as cursor:
-                await cursor.execute(sql, params)
-                rows = await cursor.fetchall()
-                return list(rows)
-        else:
-            async with self.pool.acquire() as conn:
-                async with conn.cursor(asyncmy.cursors.DictCursor) as cursor:
+        async def _do() -> list[dict[str, Any]]:
+            if self._tx_conn is not None:
+                async with self._tx_conn.cursor(asyncmy.cursors.DictCursor) as cursor:
                     await cursor.execute(sql, params)
-                    rows = await cursor.fetchall()
-                    return list(rows)
+                    return list(await cursor.fetchall())
+            else:
+                async with self.pool.acquire() as conn:
+                    async with conn.cursor(asyncmy.cursors.DictCursor) as cursor:
+                        await cursor.execute(sql, params)
+                        return list(await cursor.fetchall())
+
+        return await self._retry_on_connection_error(_do)
 
     async def fetchrow(self, sql: str, params: list[Any]) -> dict[str, Any] | None:
-        if self._tx_conn is not None:
-            async with self._tx_conn.cursor(asyncmy.cursors.DictCursor) as cursor:
-                await cursor.execute(sql, params)
-                return cast(dict[str, Any] | None, await cursor.fetchone())
-        else:
-            async with self.pool.acquire() as conn:
-                async with conn.cursor(asyncmy.cursors.DictCursor) as cursor:
+        async def _do() -> dict[str, Any] | None:
+            if self._tx_conn is not None:
+                async with self._tx_conn.cursor(asyncmy.cursors.DictCursor) as cursor:
                     await cursor.execute(sql, params)
                     return cast(dict[str, Any] | None, await cursor.fetchone())
+            else:
+                async with self.pool.acquire() as conn:
+                    async with conn.cursor(asyncmy.cursors.DictCursor) as cursor:
+                        await cursor.execute(sql, params)
+                        return cast(dict[str, Any] | None, await cursor.fetchone())
+
+        return await self._retry_on_connection_error(_do)
 
     async def close(self) -> None:
         if self._tx_conn is not None:
@@ -128,7 +146,7 @@ class MySQLDialect(AbstractDialect):
         elif base is str:
             if column_info.max_length is not None:
                 return f"VARCHAR({column_info.max_length})"
-            return "VARCHAR(255)"
+            return "TEXT"
         elif base is bool:
             return "BOOL"
         elif base is float:
@@ -165,6 +183,15 @@ class MySQLDialect(AbstractDialect):
             result[col.column_name.lower()] = col
         return result
 
+    async def introspect_indexes(self, table_name: str) -> set[str]:
+        query = (
+            "SELECT INDEX_NAME FROM INFORMATION_SCHEMA.STATISTICS "
+            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s "
+            "AND INDEX_NAME != 'PRIMARY'"
+        )
+        rows = await self.fetch(query, [table_name])
+        return {r["INDEX_NAME"] for r in rows}
+
     def build_modify_columns(
         self,
         model: type[Any],
@@ -197,6 +224,48 @@ class MySQLDialect(AbstractDialect):
 
         sep = ",\n  "
         return f"ALTER TABLE {table}\n  {sep.join(col_defs)}"
+
+    def build_sync_alter(
+        self,
+        model: type[Any],
+        add_fields: list[str],
+        modify_pairs: list[tuple[str, IntrospectedColumn]],
+    ) -> str:
+        """MySQL 风格：ADD COLUMN 和 MODIFY COLUMN 合并为一条 ALTER TABLE。"""
+        table = self.quote_identifier(model.__table__)
+        clauses: list[str] = []
+
+        # -- ADD COLUMN -------------------------------------------------
+        for field_name in add_fields:
+            column = model.__columns__[field_name]
+            info = model.__column_info__[field_name]
+            col_def = self._build_column_def(model, field_name, column, info)
+            clauses.append(f"ADD COLUMN {col_def}")
+
+        # -- MODIFY COLUMN ----------------------------------------------
+        for field_name, existing in modify_pairs:
+            column = model.__columns__[field_name]
+            info = model.__column_info__[field_name]
+            annotation = model.model_fields[field_name].annotation
+            new_type = self.map_python_type(annotation, info)
+
+            old_normalized = self._normalize_type(existing.data_type)
+            new_normalized = new_type.lower()
+
+            type_changed = old_normalized != new_normalized
+            null_changed = info.nullable != existing.is_nullable
+
+            if not type_changed and not null_changed:
+                continue
+
+            col_def = self._build_column_def(model, field_name, column, info)
+            clauses.append(f"MODIFY COLUMN {col_def}")
+
+        if not clauses:
+            return ""
+
+        sep = ",\n  "
+        return f"ALTER TABLE {table}\n  {sep.join(clauses)}"
 
     def _render_json_default_expr(self, value: Any) -> str:
         """MySQL 使用 ``JSON_OBJECT`` / ``JSON_ARRAY`` 原生函数。"""

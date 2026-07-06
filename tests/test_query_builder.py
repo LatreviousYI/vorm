@@ -43,6 +43,9 @@ class DummyDialect(AbstractDialect):
     def map_python_type(self, annotation: Any, column_info: Any) -> str:
         return "INTEGER"
 
+    async def introspect_indexes(self, table_name: str) -> set[str]:
+        return set()
+
     async def introspect_columns(self, table_name: str) -> dict[str, Any]:
         return {}
 
@@ -244,6 +247,9 @@ class RecordingDialect(AbstractDialect):
 
     def map_python_type(self, annotation: Any, column_info: Any) -> str:
         return "INTEGER"
+
+    async def introspect_indexes(self, table_name: str) -> set[str]:
+        return set()
 
     async def introspect_columns(self, table_name: str) -> dict[str, Any]:
         return {}
