@@ -119,11 +119,9 @@ class PostgreSQLDialect(AbstractDialect):
             return False
         return isinstance(
             exc,
-            (
-                pg_exc.ConnectionDoesNotExistError,
-                pg_exc.ConnectionFailureError,
-                pg_exc.InterfaceError,
-            ),
+            pg_exc.ConnectionDoesNotExistError
+            | pg_exc.ConnectionFailureError
+            | pg_exc.InterfaceError,
         )
 
     def build_insert(self, instance: Model) -> tuple[str, list[Any]]:
@@ -141,6 +139,7 @@ class PostgreSQLDialect(AbstractDialect):
 
     async def execute(self, sql: str, params: list[Any]) -> Any:
         """执行写操作，INSERT 返回 lastrowid，其他返回受影响行数。"""
+
         async def _do() -> Any:
             if self._tx_conn is not None:
                 return await _run_and_parse(self._tx_conn, sql, params)

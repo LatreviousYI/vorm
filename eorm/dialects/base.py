@@ -554,9 +554,7 @@ class AbstractDialect(ABC):
         """返回表中已有索引的名称集合（不含主键）。"""
         raise NotImplementedError
 
-    def build_sync_indexes(
-        self, model: type[Model], existing_names: set[str]
-    ) -> list[str]:
+    def build_sync_indexes(self, model: type[Model], existing_names: set[str]) -> list[str]:
         """返回仅缺失索引的 ``CREATE [UNIQUE] INDEX`` 语句列表。"""
         table = self.quote_identifier(model.__table__)
         result: list[str] = []
@@ -565,14 +563,10 @@ class AbstractDialect(ABC):
             if name in existing_names:
                 continue
             cols = ", ".join(
-                self.quote_identifier(model.__columns__[f].column_name)
-                for f in idx.fields
+                self.quote_identifier(model.__columns__[f].column_name) for f in idx.fields
             )
             unique = "UNIQUE " if idx.unique else ""
-            result.append(
-                f"CREATE {unique}INDEX {self.quote_identifier(name)} "
-                f"ON {table} ({cols})"
-            )
+            result.append(f"CREATE {unique}INDEX {self.quote_identifier(name)} ON {table} ({cols})")
         return result
 
     # ------------------------------------------------------------------
