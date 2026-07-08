@@ -11,3 +11,9 @@ wheels/
 .vscode
 
 examples/
+
+CLAUDE.md
+findings.md
+progress.md
+.claude/
+task_plan.md
