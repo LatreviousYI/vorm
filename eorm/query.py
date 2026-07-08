@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Generic, TypeVar, cast
 
 from eorm.exceptions import DoesNotExist, MultipleObjectsReturned
-from eorm.expression import Column, Expression, OrderExpression
+from eorm.expression import AliasedColumn, Column, Expression, OrderExpression
 from eorm.model import Model
 from eorm.row import Row
 
@@ -44,6 +44,7 @@ class QuerySet(Generic[ModelT]):
         self.limit_count: int | None = None
         self.offset_count: int | None = None
         self.joins: list[JoinInfo] = []
+        self._selected: tuple[Column | AliasedColumn, ...] | None = None
 
     def _clone(self) -> QuerySet[ModelT]:
         clone = type(self)(self.session, self.model)
@@ -52,6 +53,7 @@ class QuerySet(Generic[ModelT]):
         clone.limit_count = self.limit_count
         clone.offset_count = self.offset_count
         clone.joins = [*self.joins]
+        clone._selected = self._selected
         return clone
 
     def filter(self, *exprs: Any) -> QuerySet[ModelT]:
@@ -86,6 +88,24 @@ class QuerySet(Generic[ModelT]):
         clone.joins.append(JoinInfo(model, on, type.upper()))
         return clone
 
+    def select(self, *columns: Column | AliasedColumn) -> QuerySet[ModelT]:
+        """指定要查询的列（支持别名）。
+
+        用法::
+
+            results = await session.query(User).join(
+                Post, on=User.id == Post.user_id
+            ).select(
+                User.id.alias("user_id"),
+                User.name.alias("user_name"),
+                Post.title.alias("post_title"),
+            ).all()
+            # results → [{"user_id": 1, "user_name": "a", "post_title": "hello"}, ...]
+        """
+        clone = self._clone()
+        clone._selected = columns
+        return clone
+
     def build_sql(self) -> tuple[str, list[Any]]:
         return cast(tuple[str, list[Any]], self.session.dialect.build_select(self))
 
@@ -94,12 +114,17 @@ class QuerySet(Generic[ModelT]):
     def _table_names(self) -> list[str]:
         return [self.model.__table__] + [j.model.__table__ for j in self.joins]
 
-    async def all(self) -> list[Any]:
+    async def all(self) -> list[ModelT]:
         sql, params = self.build_sql()
         rows = await self.session.dialect.fetch(sql, params)
+
+        # select() 模式：直接返回数据库行字典
+        if self._selected is not None:
+            return rows
+
         if self.joins:
             table_names = self._table_names()
-            return [Row(row, table_names) for row in rows]
+            return [Row(row, table_names) for row in rows]  # type: ignore[return-value]
 
         # 将 JSON 字符串反序列化为 Python 对象再交给 Pydantic 校验
         for row in rows:
@@ -115,11 +140,11 @@ class QuerySet(Generic[ModelT]):
                             pass
         return [self.model.model_validate(row) for row in rows]
 
-    async def first(self) -> Any:
+    async def first(self) -> ModelT | None:
         rows = await self.limit(1).all()
         return rows[0] if rows else None
 
-    async def one(self) -> Any:
+    async def one(self) -> ModelT:
         rows = await self.limit(2).all()
         if not rows:
             raise DoesNotExist(f"No {self.model.__name__} row matched the query")

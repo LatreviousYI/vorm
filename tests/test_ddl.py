@@ -429,8 +429,9 @@ async def test_sync_table_noop_when_all_columns_exist() -> None:
         "name": IntrospectedColumn("name", "varchar(100)", is_nullable=False),
         "email": IntrospectedColumn("email", "text", is_nullable=True),
         "age": IntrospectedColumn("age", "integer", is_nullable=True),
-        # User.is_active 默认 nullable=True，DB 也应是 True
-        "is_active": IntrospectedColumn("is_active", "boolean", is_nullable=True),
+        "is_active": IntrospectedColumn(
+            "is_active", "boolean", is_nullable=True, column_default="true"
+        ),
     }
     dialect = RecordingDDLDialect(introspect_result=existing)
     session = Session(dialect)
@@ -588,6 +589,122 @@ async def test_sync_table_new_columns_and_modifications_combined() -> None:
     sql = dialect.executed_sqls[0]
     assert "ADD COLUMN" in sql
     assert "ALTER COLUMN" in sql or "MODIFY" in sql
+
+
+# ---------------------------------------------------------------------------
+# 默认值变更检测
+# ---------------------------------------------------------------------------
+
+
+class DefaultTestModel(Model):
+    """带默认值的模型，用于测试 sync_table 的默认值变更检测。"""
+
+    class Meta:
+        table = "default_test"
+
+    id: int = Field(primary_key=True, auto_increment=True)
+    name: str = Field(default="hello")
+    status: str = Field(default="active", max_length=20)
+
+
+async def test_sync_table_default_unchanged() -> None:
+    """当默认值未变化时，不应触发 MODIFY。"""
+    existing = {
+        "id": IntrospectedColumn("id", "serial", is_nullable=False),
+        "name": IntrospectedColumn(
+            "name",
+            "text",
+            is_nullable=True,
+            column_default="'hello'::character varying",
+        ),
+        "status": IntrospectedColumn(
+            "status",
+            "varchar(20)",
+            is_nullable=True,
+            column_default="'active'::character varying",
+        ),
+    }
+    dialect = RecordingDDLDialect(introspect_result=existing)
+    session = Session(dialect)
+
+    await DefaultTestModel.sync_table(session.dialect)
+
+    assert len(dialect.executed_sqls) == 0
+
+
+async def test_sync_table_default_added() -> None:
+    """模型中新增了默认值但 DB 中无默认值时，应触发 SET DEFAULT。"""
+    existing = {
+        "id": IntrospectedColumn("id", "serial", is_nullable=False),
+        "name": IntrospectedColumn("name", "varchar", is_nullable=True, column_default=None),
+        "status": IntrospectedColumn(
+            "status", "varchar(20)", is_nullable=True, column_default=None
+        ),
+    }
+    dialect = RecordingDDLDialect(introspect_result=existing)
+    session = Session(dialect)
+
+    await DefaultTestModel.sync_table(session.dialect)
+
+    sql = " ".join(dialect.executed_sqls)
+    assert "SET DEFAULT" in sql
+    assert "'hello'" in sql
+    assert "'active'" in sql
+
+
+async def test_sync_table_default_removed() -> None:
+    """模型中移除了默认值但 DB 中还残留时，应触发 DROP DEFAULT。"""
+    # 用无默认值的 User 模型，但 DB 有残留默认值
+    existing = {
+        "id": IntrospectedColumn("id", "serial", is_nullable=False),
+        "name": IntrospectedColumn(
+            "name", "varchar(100)", is_nullable=False, column_default="'old'"
+        ),
+        "email": IntrospectedColumn("email", "text", is_nullable=True),
+        "age": IntrospectedColumn("age", "integer", is_nullable=True),
+        "is_active": IntrospectedColumn(
+            "is_active", "boolean", is_nullable=True, column_default="true"
+        ),
+    }
+    dialect = RecordingDDLDialect(introspect_result=existing)
+    session = Session(dialect)
+
+    await User.sync_table(session.dialect)
+
+    sql = " ".join(dialect.executed_sqls)
+    # name: 模型中无默认值，DB 有 'old' → DROP DEFAULT
+    # is_active: 模型有 default=True，DB 也有 true → 一致，不会触发
+    assert "DROP DEFAULT" in sql
+    assert "name" in sql
+
+
+async def test_sync_table_default_value_changed() -> None:
+    """模型中默认值变更时，应触发 SET DEFAULT。"""
+    existing = {
+        "id": IntrospectedColumn("id", "serial", is_nullable=False),
+        "name": IntrospectedColumn(
+            "name",
+            "varchar",
+            is_nullable=True,
+            column_default="'world'::character varying",
+        ),
+        "status": IntrospectedColumn(
+            "status",
+            "varchar(20)",
+            is_nullable=True,
+            column_default="'active'::character varying",
+        ),
+    }
+    dialect = RecordingDDLDialect(introspect_result=existing)
+    session = Session(dialect)
+
+    await DefaultTestModel.sync_table(session.dialect)
+
+    sql = " ".join(dialect.executed_sqls)
+    # name 默认值变了：world → hello
+    assert "SET DEFAULT 'hello'" in sql or "SET DEFAULT" in sql
+    # status 默认值未变：active → active，不应出现
+    assert "status" not in sql
 
 
 # ---------------------------------------------------------------------------

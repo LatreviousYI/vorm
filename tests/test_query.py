@@ -580,3 +580,62 @@ async def test_ping_fails_on_exception(raw_session: Session) -> None:
     dialect = FailingDialect()
     ok = await dialect.ping()
     assert ok is False
+
+
+# ---------------------------------------------------------------------------
+# select() — 字段选择与别名
+# ---------------------------------------------------------------------------
+
+
+async def test_select_all_returns_dicts(
+    session: Session, dialect: ConfigurableDialect, sample_rows: list[dict[str, Any]]
+) -> None:
+    """select() 模式下 all() 应直接返回数据库行字典，不构建 Model。"""
+    dialect.fetch_rows = sample_rows
+
+    rows = await session.query(User).select(User.id, User.name).all()
+
+    assert len(rows) == 3
+    assert all(isinstance(r, dict) for r in rows)
+    # 验证返回的是原始行 dict（包含被选列）
+    assert "id" in rows[0]
+    assert "name" in rows[0]
+    # age 没有被 select，但数据库行可能仍返回它（取决于方言），这里只验证是 dict
+
+
+async def test_select_first_returns_dict(
+    session: Session, dialect: ConfigurableDialect, sample_rows: list[dict[str, Any]]
+) -> None:
+    """select() 模式下 first() 应返回单个 dict。"""
+    dialect.fetch_rows = [sample_rows[0]]
+
+    row = await session.query(User).select(User.id, User.name).first()
+
+    assert isinstance(row, dict)
+    assert "id" in row
+    assert "name" in row
+
+
+async def test_select_one_returns_dict(
+    session: Session, dialect: ConfigurableDialect, sample_rows: list[dict[str, Any]]
+) -> None:
+    """select() 模式下 one() 应返回单个 dict。"""
+    dialect.fetch_rows = [sample_rows[0]]
+
+    row = await session.query(User).select(User.id, User.name).one()
+
+    assert isinstance(row, dict)
+    assert "id" in row
+    assert "name" in row
+
+
+async def test_select_without_select_still_returns_models(
+    session: Session, dialect: ConfigurableDialect, sample_rows: list[dict[str, Any]]
+) -> None:
+    """不使用 select() 时，all() 仍应返回 Model 实例（回归验证）。"""
+    dialect.fetch_rows = sample_rows
+
+    users = await session.query(User).all()
+
+    assert len(users) == 3
+    assert all(isinstance(u, User) for u in users)

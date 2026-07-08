@@ -556,3 +556,71 @@ def test_build_insert_includes_all_timestamps(session: Session) -> None:
     assert "created_at" in sql
     assert "updated_at" in sql
     assert "title" in sql
+
+
+# ---------------------------------------------------------------------------
+# select() — 字段选择 + 别名
+# ---------------------------------------------------------------------------
+
+
+def test_select_columns_basic(session: Session) -> None:
+    """select() 指定列时应只生成对应列，不含其他列。"""
+    sql, params = session.query(User).select(User.id, User.name).build_sql()
+
+    assert '"users"."id"' in sql
+    assert '"users"."name"' in sql
+    # age 不应出现
+    assert '"users"."age"' not in sql
+    assert params == []
+
+
+def test_select_columns_with_alias(session: Session) -> None:
+    """select() 加 alias 应生成 AS 子句。"""
+    sql, params = (
+        session.query(User)
+        .select(User.id.alias("user_id"), User.name.alias("user_name"))
+        .build_sql()
+    )
+
+    assert '"users"."id" AS "user_id"' in sql
+    assert '"users"."name" AS "user_name"' in sql
+    assert params == []
+
+
+def test_select_with_filter(session: Session) -> None:
+    """select() 可以与 filter 组合使用。"""
+    sql, params = session.query(User).select(User.id, User.name).filter(User.age > 18).build_sql()
+
+    assert '"users"."id"' in sql
+    assert '"users"."name"' in sql
+    assert ">" in sql
+    assert params == [18]
+
+
+def test_select_with_join_and_alias(session: Session) -> None:
+    """select() + join + alias 应生成自定义列名的 JOIN 查询。"""
+
+    class Post(Model):
+        class Meta:
+            table = "posts"
+
+        id: int = Field(primary_key=True, auto_increment=True)
+        user_id: int
+        title: str
+
+    sql, params = (
+        session.query(User)
+        .join(Post, on=User.id == Post.user_id)
+        .select(
+            User.id.alias("user_id"),
+            User.name.alias("user_name"),
+            Post.title.alias("post_title"),
+        )
+        .build_sql()
+    )
+
+    assert '"users"."id" AS "user_id"' in sql
+    assert '"users"."name" AS "user_name"' in sql
+    assert '"posts"."title" AS "post_title"' in sql
+    assert 'INNER JOIN "posts"' in sql
+    assert params == []

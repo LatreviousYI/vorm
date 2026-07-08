@@ -7,14 +7,14 @@ from typing import Any
 from eorm.dialects.mysql import create_mysql_dialect
 from eorm.dialects.postgresql import create_postgresql_dialect
 from eorm.model import Model
-from eorm.query import QuerySet
+from eorm.query import ModelT, QuerySet
 
 
 class Session:
     def __init__(self, dialect: Any) -> None:
         self.dialect = dialect
 
-    def query(self, model: type[Model]) -> QuerySet[Any]:
+    def query(self, model: type[ModelT]) -> QuerySet[ModelT]:
         return QuerySet(self, model)
 
     # -- 单条增 / 改 --------------------------------------------------------

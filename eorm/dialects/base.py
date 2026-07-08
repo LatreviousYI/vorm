@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import asyncio
 import datetime as _dt
 import json as _json_mod
+import re
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any
 
@@ -114,32 +114,6 @@ class AbstractDialect(ABC):
         except Exception:
             return False
 
-    # -- 断连重试 ---------------------------------------------------------
-
-    @staticmethod
-    def _is_connection_error(_exc: Exception) -> bool:
-        """判断是否为连接错误（各方言覆盖）。默认不识别任何错误。"""
-        return False
-
-    async def _retry_on_connection_error(self, coro_factory: Any) -> Any:
-        """连接断开时自动重试（最多 3 次，指数退避）。
-
-        ``coro_factory`` 为无参可调用对象，每次重试时重新创建协程，
-        保证从连接池获取全新连接。
-        """
-        max_retries = 3
-        base_delay = 0.3
-        last_exc: Exception | None = None
-        for attempt in range(max_retries + 1):
-            try:
-                return await coro_factory()
-            except Exception as exc:
-                last_exc = exc
-                if not self._is_connection_error(exc) or attempt >= max_retries:
-                    raise
-                await asyncio.sleep(base_delay * (2**attempt))
-        raise last_exc  # type: ignore[misc]
-
     # ------------------------------------------------------------------
     # SQL 生成
     # ------------------------------------------------------------------
@@ -151,6 +125,14 @@ class AbstractDialect(ABC):
 
         if count:
             sql = f"SELECT COUNT(*) AS count FROM {table}"
+            for j in query.joins:
+                jt = self.quote_identifier(j.model.__table__)
+                on_clause = j.on.render(self, params)
+                sql = f"{sql} {j.join_type} JOIN {jt} ON {on_clause}"
+        elif query._selected is not None:
+            # 用户指定了列（支持别名）
+            column_sql = ", ".join(col.render(self) for col in query._selected)
+            sql = f"SELECT {column_sql} FROM {table}"
             for j in query.joins:
                 jt = self.quote_identifier(j.model.__table__)
                 on_clause = j.on.render(self, params)
@@ -194,8 +176,9 @@ class AbstractDialect(ABC):
     def build_insert(self, instance: Model) -> tuple[str, list[Any]]:
         model = type(instance)
         field_names, params = self._collect_writable_fields(instance)
+        model_columns = model.__columns__
         columns = ", ".join(
-            self.quote_identifier(model.__columns__[fn].column_name) for fn in field_names
+            self.quote_identifier(model_columns[fn].column_name) for fn in field_names
         )
         placeholders = ", ".join(self.render_placeholder(i) for i in range(1, len(params) + 1))
         sql = (
@@ -211,9 +194,8 @@ class AbstractDialect(ABC):
         model = type(instances[0])
         # 用第一条实例确定列（假设所有实例列结构相同）
         field_names, _ = self._collect_writable_fields(instances[0])
-        column_names = [
-            self.quote_identifier(model.__columns__[fn].column_name) for fn in field_names
-        ]
+        model_columns = model.__columns__
+        column_names = [self.quote_identifier(model_columns[fn].column_name) for fn in field_names]
 
         params: list[Any] = []
         row_placeholders: list[str] = []
@@ -242,11 +224,12 @@ class AbstractDialect(ABC):
         pk_name = model.primary_key_name()
         params: list[Any] = []
         assignments: list[str] = []
+        model_column_info = model.__column_info__
         for field_name, column in model.__columns__.items():
             if field_name == pk_name:
                 continue
 
-            info = model.__column_info__[field_name]
+            info = model_column_info[field_name]
             # "create" 行为的时间戳字段在 UPDATE 时跳过，保留原值
             if info.timestamp_behavior == "create":
                 continue
@@ -294,8 +277,9 @@ class AbstractDialect(ABC):
                 all_values[field_name] = factory() if factory is not None else _dt.datetime.now()
 
         assignments: list[str] = []
+        model_columns = model.__columns__
         for field_name, value in all_values.items():
-            col = self.quote_identifier(model.__columns__[field_name].column_name)
+            col = self.quote_identifier(model_columns[field_name].column_name)
             if isinstance(value, dict | list):
                 value = _json_mod.dumps(value)
             params.append(value)
@@ -407,15 +391,79 @@ class AbstractDialect(ABC):
             return f"DEFAULT {'TRUE' if default else 'FALSE'}"
         if isinstance(default, int | float):
             return f"DEFAULT {default}"
+        if default is None:
+            return "DEFAULT NULL"
 
         return ""
+
+    # ------------------------------------------------------------------
+    # 默认值比较（sync_table 用）
+    # ------------------------------------------------------------------
+
+    def _normalize_column_default(self, raw: str | None) -> str:
+        """Normalize database column_default for comparison.
+
+        PG-style: strips ``::type`` suffix (e.g. ``'hello'::character varying`` → ``'hello'``).
+        MySQL dialects override this to pass through raw values.
+        """
+        if raw is None:
+            return ""
+        # Strip ::type suffix like ::character varying, ::text, ::jsonb, ::boolean, etc.
+        normalized = re.sub(r"::\w+(\s+\w+)*\s*$", "", raw.strip())
+        return normalized.strip()
+
+    def _alter_column_type(self, sql_type: str) -> str:
+        """Return the type to use in ALTER COLUMN ... TYPE clause.
+
+        PG overrides this to convert SERIAL/BIGSERIAL to their underlying types.
+        """
+        return sql_type
+
+    def _default_changed(
+        self,
+        model: type[Model],
+        field_name: str,
+        existing: IntrospectedColumn,
+    ) -> bool:
+        """Check if the DEFAULT value has changed between model and DB."""
+        field_info = model.model_fields[field_name]
+        info = model.__column_info__[field_name]
+        annotation = field_info.annotation
+        sql_type = self.map_python_type(annotation, info)
+        expected = self._render_default_clause(field_info, sql_type)
+
+        # "DEFAULT 'hello'" → "'hello'"
+        expected_value = expected.removeprefix("DEFAULT ").strip() if expected else ""
+        db_value = self._normalize_column_default(existing.column_default)
+
+        # Both empty → no change
+        if not expected_value and not db_value:
+            return False
+
+        # "DEFAULT NULL" ↔ DB NULL 语义等价（DB 无法区分"无默认值"和"DEFAULT NULL"）
+        if expected_value.upper() == "NULL" and existing.column_default is None:
+            return False
+
+        # One has default, the other doesn't
+        if bool(expected_value) != bool(db_value):
+            return True
+
+        # Both non-empty → normalize and compare (case-insensitive)
+        def _strip_quotes(v: str) -> str:
+            v = v.strip()
+            if v.startswith("'") and v.endswith("'"):
+                return v[1:-1]
+            return v
+
+        return _strip_quotes(expected_value).upper() != _strip_quotes(db_value).upper()
 
     def build_create_table(self, model: type[Model]) -> str:
         """生成 ``CREATE TABLE IF NOT EXISTS ...`` 语句。"""
         table = self.quote_identifier(model.__table__)
         definitions: list[str] = []
+        model_column_info = model.__column_info__
         for field_name, column in model.__columns__.items():
-            info = model.__column_info__[field_name]
+            info = model_column_info[field_name]
             definitions.append(f"  {self._build_column_def(model, field_name, column, info)}")
         columns_sql = ",\n".join(definitions)
         return f"CREATE TABLE IF NOT EXISTS {table} (\n{columns_sql}\n)"
@@ -435,9 +483,11 @@ class AbstractDialect(ABC):
         """
         table = self.quote_identifier(model.__table__)
         col_defs: list[str] = []
+        model_columns = model.__columns__
+        model_column_info = model.__column_info__
         for field_name in field_names:
-            column = model.__columns__[field_name]
-            info = model.__column_info__[field_name]
+            column = model_columns[field_name]
+            info = model_column_info[field_name]
             col_def = self._build_column_def(model, field_name, column, info)
             col_defs.append(f"ADD COLUMN {col_def}")
         sep = ",\n  "
@@ -465,10 +515,12 @@ class AbstractDialect(ABC):
         """
         table = self.quote_identifier(model.__table__)
         clauses: list[str] = []
+        model_columns = model.__columns__
+        model_column_info = model.__column_info__
 
         for field_name, existing in field_pairs:
-            column = model.__columns__[field_name]
-            info = model.__column_info__[field_name]
+            column = model_columns[field_name]
+            info = model_column_info[field_name]
             annotation = model.model_fields[field_name].annotation
             new_type = self.map_python_type(annotation, info)
             col_name = self.quote_identifier(column.column_name)
@@ -478,18 +530,29 @@ class AbstractDialect(ABC):
 
             type_changed = old_normalized != new_normalized
             null_changed = info.nullable != existing.is_nullable
+            default_changed = self._default_changed(model, field_name, existing)
 
-            if not type_changed and not null_changed:
+            if not type_changed and not null_changed and not default_changed:
                 continue
 
             if type_changed:
-                clauses.append(f"ALTER COLUMN {col_name} TYPE {new_type}")
+                clauses.append(f"ALTER COLUMN {col_name} TYPE {self._alter_column_type(new_type)}")
 
             if null_changed:
                 if info.nullable:
                     clauses.append(f"ALTER COLUMN {col_name} DROP NOT NULL")
                 else:
                     clauses.append(f"ALTER COLUMN {col_name} SET NOT NULL")
+
+            if default_changed:
+                expected = self._render_default_clause(
+                    model.model_fields[field_name],
+                    new_type,
+                )
+                if expected:
+                    clauses.append(f"ALTER COLUMN {col_name} SET {expected}")
+                else:
+                    clauses.append(f"ALTER COLUMN {col_name} DROP DEFAULT")
 
         if not clauses:
             return ""
@@ -509,18 +572,20 @@ class AbstractDialect(ABC):
         """
         table = self.quote_identifier(model.__table__)
         clauses: list[str] = []
+        model_columns = model.__columns__
+        model_column_info = model.__column_info__
 
         # -- ADD COLUMN -------------------------------------------------
         for field_name in add_fields:
-            column = model.__columns__[field_name]
-            info = model.__column_info__[field_name]
+            column = model_columns[field_name]
+            info = model_column_info[field_name]
             col_def = self._build_column_def(model, field_name, column, info)
             clauses.append(f"ADD COLUMN {col_def}")
 
         # -- MODIFY -----------------------------------------------------
         for field_name, existing in modify_pairs:
-            column = model.__columns__[field_name]
-            info = model.__column_info__[field_name]
+            column = model_columns[field_name]
+            info = model_column_info[field_name]
             annotation = model.model_fields[field_name].annotation
             new_type = self.map_python_type(annotation, info)
             col_name = self.quote_identifier(column.column_name)
@@ -530,20 +595,44 @@ class AbstractDialect(ABC):
 
             type_changed = old_normalized != new_normalized
             null_changed = info.nullable != existing.is_nullable
+            default_changed = self._default_changed(model, field_name, existing)
+
+            if not type_changed and not null_changed and not default_changed:
+                continue
 
             if type_changed:
-                clauses.append(f"ALTER COLUMN {col_name} TYPE {new_type}")
+                clauses.append(f"ALTER COLUMN {col_name} TYPE {self._alter_column_type(new_type)}")
             if null_changed:
                 if info.nullable:
                     clauses.append(f"ALTER COLUMN {col_name} DROP NOT NULL")
                 else:
                     clauses.append(f"ALTER COLUMN {col_name} SET NOT NULL")
+            if default_changed:
+                expected = self._render_default_clause(
+                    model.model_fields[field_name],
+                    new_type,
+                )
+                if expected:
+                    clauses.append(f"ALTER COLUMN {col_name} SET {expected}")
+                else:
+                    clauses.append(f"ALTER COLUMN {col_name} DROP DEFAULT")
 
         if not clauses:
             return ""
 
         sep = ",\n  "
         return f"ALTER TABLE {table}\n  {sep.join(clauses)}"
+
+    def build_post_alter(
+        self,
+        model: type[Model],
+        modified: list[tuple[str, IntrospectedColumn]],
+    ) -> list[str]:
+        """返回 ALTER TABLE 之后需要执行的额外 DDL 语句。
+
+        PG 覆写：为 auto_increment 主键创建序列 + SET DEFAULT。
+        """
+        return []
 
     # ------------------------------------------------------------------
     # 索引
@@ -558,12 +647,13 @@ class AbstractDialect(ABC):
         """返回仅缺失索引的 ``CREATE [UNIQUE] INDEX`` 语句列表。"""
         table = self.quote_identifier(model.__table__)
         result: list[str] = []
+        model_columns = model.__columns__
         for idx in model.__indexes__:
             name = idx.index_name(model.__table__)
             if name in existing_names:
                 continue
             cols = ", ".join(
-                self.quote_identifier(model.__columns__[f].column_name) for f in idx.fields
+                self.quote_identifier(model_columns[f].column_name) for f in idx.fields
             )
             unique = "UNIQUE " if idx.unique else ""
             result.append(f"CREATE {unique}INDEX {self.quote_identifier(name)} ON {table} ({cols})")
@@ -607,8 +697,9 @@ class AbstractDialect(ABC):
         model = type(instance)
         field_names: list[str] = []
         params: list[Any] = []
+        model_column_info = model.__column_info__
         for field_name in model.__columns__:
-            info = model.__column_info__[field_name]
+            info = model_column_info[field_name]
             value = getattr(instance, field_name)
             if info.primary_key and info.auto_increment and value is None:
                 continue

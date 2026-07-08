@@ -115,6 +115,17 @@ class BetweenExpression(Expression):
 
 
 @dataclass(frozen=True)
+class AliasedColumn:
+    """A Column with an explicit alias name."""
+
+    column: Column
+    alias_name: str
+
+    def render(self, dialect: AbstractDialect) -> str:
+        return f"{self.column.render(dialect)} AS {dialect.quote_identifier(self.alias_name)}"
+
+
+@dataclass(frozen=True)
 class JSONPathExpression(Expression):
     """A JSON path extraction like ``column->>'$.key'`` that can be compared."""
 
@@ -184,6 +195,10 @@ class Column:
         ``as_text=False`` uses ``->``, returning JSON/JSONB.
         """
         return JSONPathExpression(self, path, as_text)
+
+    def alias(self, name: str) -> AliasedColumn:
+        """Create an aliased column reference, e.g. ``User.id.alias("user_id")``."""
+        return AliasedColumn(self, name)
 
     def in_(self, values: Iterable[Any]) -> InExpression:
         return InExpression(self, tuple(values))

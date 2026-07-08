@@ -92,10 +92,10 @@ session = await connect_mysql(host="localhost", user="root", password="", databa
 engine = await create_postgresql_engine(host="localhost", user="postgres", password="", database="test")
 session = engine.session()
 
-# TCP keepalive（OS 层自动检测断连）
-engine = await create_mysql_engine(
-    host="localhost", user="root", password="", database="test",
-    keepalive_idle=30, keepalive_interval=10, keepalive_count=3,
+# PostgreSQL TCP keepalive（OS 层自动检测物理断连）
+engine = await create_postgresql_engine(
+    host="localhost", user="postgres", password="", database="test",
+    keepalives_idle=30, keepalives_interval=10, keepalives_count=3,
 )
 ```
 
@@ -273,4 +273,4 @@ uv run ruff check eorm/     # 代码风格
 
 ## License
 
-MIT
+[Apache License](./LICENSE)

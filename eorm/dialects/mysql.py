@@ -35,97 +35,70 @@ class MySQLDialect(AbstractDialect):
         await self._tx_conn.begin()
 
     async def commit(self) -> None:
-        conn = self._tx_conn
-        if conn is None:
+        if self._tx_conn is None:
             raise RuntimeError("No transaction in progress")
         try:
-            await conn.commit()
+            await self._tx_conn.commit()
         finally:
+            await self.pool.release(self._tx_conn)
             self._tx_conn = None
-            self.pool.release(conn)
 
     async def rollback(self) -> None:
-        conn = self._tx_conn
-        if conn is None:
+        if self._tx_conn is None:
             raise RuntimeError("No transaction in progress")
         try:
-            await conn.rollback()
+            await self._tx_conn.rollback()
         finally:
+            await self.pool.release(self._tx_conn)
             self._tx_conn = None
-            self.pool.release(conn)
 
     # -- 执行 ---------------------------------------------------------------
 
-    @staticmethod
-    def _is_connection_error(exc: Exception) -> bool:
-        """MySQL 连接断开类错误。"""
-        try:
-            from asyncmy.errors import OperationalError
-        except ImportError:
-            return False
-        return isinstance(exc, OperationalError)
-
     async def execute(self, sql: str, params: list[Any]) -> Any:
-        async def _do() -> Any:
-            if self._tx_conn is not None:
-                async with self._tx_conn.cursor() as cursor:
-                    await cursor.execute(sql, params)
-                    return cursor.rowcount
-            else:
-                async with self.pool.acquire() as conn:
-                    async with conn.cursor() as cursor:
-                        await cursor.execute(sql, params)
-                        await conn.commit()
-                        return cursor.rowcount
-
-        return await self._retry_on_connection_error(_do)
+        if self._tx_conn is not None:
+            async with self._tx_conn.cursor() as cursor:
+                await cursor.execute(sql, params)
+                return cursor.rowcount
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(sql, params)
+                await conn.commit()
+                return cursor.rowcount
 
     async def execute_insert(self, sql: str, params: list[Any]) -> Any:
-        async def _do() -> Any:
-            if self._tx_conn is not None:
-                async with self._tx_conn.cursor() as cursor:
-                    await cursor.execute(sql, params)
-                    return cursor.lastrowid
-            else:
-                async with self.pool.acquire() as conn:
-                    async with conn.cursor() as cursor:
-                        await cursor.execute(sql, params)
-                        await conn.commit()
-                        return cursor.lastrowid
-
-        return await self._retry_on_connection_error(_do)
+        if self._tx_conn is not None:
+            async with self._tx_conn.cursor() as cursor:
+                await cursor.execute(sql, params)
+                return cursor.lastrowid
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(sql, params)
+                await conn.commit()
+                return cursor.lastrowid
 
     async def fetch(self, sql: str, params: list[Any]) -> list[dict[str, Any]]:
-        async def _do() -> list[dict[str, Any]]:
-            if self._tx_conn is not None:
-                async with self._tx_conn.cursor(asyncmy.cursors.DictCursor) as cursor:
-                    await cursor.execute(sql, params)
-                    return list(await cursor.fetchall())
-            else:
-                async with self.pool.acquire() as conn:
-                    async with conn.cursor(asyncmy.cursors.DictCursor) as cursor:
-                        await cursor.execute(sql, params)
-                        return list(await cursor.fetchall())
-
-        return await self._retry_on_connection_error(_do)
+        if self._tx_conn is not None:
+            async with self._tx_conn.cursor(asyncmy.cursors.DictCursor) as cursor:
+                await cursor.execute(sql, params)
+                return list(await cursor.fetchall())
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(asyncmy.cursors.DictCursor) as cursor:
+                await cursor.execute(sql, params)
+                return list(await cursor.fetchall())
 
     async def fetchrow(self, sql: str, params: list[Any]) -> dict[str, Any] | None:
-        async def _do() -> dict[str, Any] | None:
-            if self._tx_conn is not None:
-                async with self._tx_conn.cursor(asyncmy.cursors.DictCursor) as cursor:
-                    await cursor.execute(sql, params)
-                    return cast(dict[str, Any] | None, await cursor.fetchone())
-            else:
-                async with self.pool.acquire() as conn:
-                    async with conn.cursor(asyncmy.cursors.DictCursor) as cursor:
-                        await cursor.execute(sql, params)
-                        return cast(dict[str, Any] | None, await cursor.fetchone())
-
-        return await self._retry_on_connection_error(_do)
+        if self._tx_conn is not None:
+            async with self._tx_conn.cursor(asyncmy.cursors.DictCursor) as cursor:
+                await cursor.execute(sql, params)
+                return cast(dict[str, Any] | None, await cursor.fetchone())
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(asyncmy.cursors.DictCursor) as cursor:
+                await cursor.execute(sql, params)
+                return cast(dict[str, Any] | None, await cursor.fetchone())
 
     async def close(self) -> None:
         if self._tx_conn is not None:
-            self.pool.release(self._tx_conn)
+            await self.pool.release(self._tx_conn)
             self._tx_conn = None
         if self._owns_pool:
             self.pool.close()
@@ -200,10 +173,12 @@ class MySQLDialect(AbstractDialect):
         """MySQL 风格：``ALTER TABLE ... MODIFY COLUMN col def, MODIFY COLUMN col def``。"""
         table = self.quote_identifier(model.__table__)
         col_defs: list[str] = []
+        model_columns = model.__columns__
+        model_column_info = model.__column_info__
 
         for field_name, existing in field_pairs:
-            column = model.__columns__[field_name]
-            info = model.__column_info__[field_name]
+            column = model_columns[field_name]
+            info = model_column_info[field_name]
             annotation = model.model_fields[field_name].annotation
             new_type = self.map_python_type(annotation, info)
 
@@ -212,8 +187,9 @@ class MySQLDialect(AbstractDialect):
 
             type_changed = old_normalized != new_normalized
             null_changed = info.nullable != existing.is_nullable
+            default_changed = self._default_changed(model, field_name, existing)
 
-            if not type_changed and not null_changed:
+            if not type_changed and not null_changed and not default_changed:
                 continue
 
             col_def = self._build_column_def(model, field_name, column, info)
@@ -234,18 +210,20 @@ class MySQLDialect(AbstractDialect):
         """MySQL 风格：ADD COLUMN 和 MODIFY COLUMN 合并为一条 ALTER TABLE。"""
         table = self.quote_identifier(model.__table__)
         clauses: list[str] = []
+        model_columns = model.__columns__
+        model_column_info = model.__column_info__
 
         # -- ADD COLUMN -------------------------------------------------
         for field_name in add_fields:
-            column = model.__columns__[field_name]
-            info = model.__column_info__[field_name]
+            column = model_columns[field_name]
+            info = model_column_info[field_name]
             col_def = self._build_column_def(model, field_name, column, info)
             clauses.append(f"ADD COLUMN {col_def}")
 
         # -- MODIFY COLUMN ----------------------------------------------
         for field_name, existing in modify_pairs:
-            column = model.__columns__[field_name]
-            info = model.__column_info__[field_name]
+            column = model_columns[field_name]
+            info = model_column_info[field_name]
             annotation = model.model_fields[field_name].annotation
             new_type = self.map_python_type(annotation, info)
 
@@ -254,8 +232,9 @@ class MySQLDialect(AbstractDialect):
 
             type_changed = old_normalized != new_normalized
             null_changed = info.nullable != existing.is_nullable
+            default_changed = self._default_changed(model, field_name, existing)
 
-            if not type_changed and not null_changed:
+            if not type_changed and not null_changed and not default_changed:
                 continue
 
             col_def = self._build_column_def(model, field_name, column, info)
@@ -294,6 +273,8 @@ class MySQLDialect(AbstractDialect):
             return f"DEFAULT {1 if default else 0}"
         if isinstance(default, int | float):
             return f"DEFAULT {default}"
+        if default is None:
+            return "DEFAULT NULL"
 
         return ""
 

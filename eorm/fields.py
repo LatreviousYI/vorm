@@ -67,7 +67,7 @@ def Field(
         primary_key=primary_key,
         auto_increment=auto_increment,
         column_name=column_name,
-        nullable=nullable,
+        nullable=False if primary_key else nullable,
         unique=unique,
         index=index,
         max_length=max_length,

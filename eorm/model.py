@@ -71,9 +71,20 @@ class ModelMeta(ModelMetaclass):
     def __getattribute__(cls, name: str) -> Any:
         """将 ORM 字段名拦截为 Column 对象，避免 setattr 覆盖原始类型标注。
 
-        只拦截类级别访问（如 ``User.name``），不影响实例访问（``user.name``）。
+        只拦截类级别访问（如 ``User.name``），
+        不影响实例访问（``user.name``）。
+        为什么要绕一圈走 __dict__？ 避免无限递归。
+        如果在 __getattribute__ 里写 cls.__columns__，这个 .
+        又会触发 __getattribute__ 自身，形成死循环。
+        所以先用 super() 跳到 type.__getattribute__ 拿到原始 __dict__，
+        再从里面取 "__columns__"，安全绕过拦截。
+        简单说：__new__ 负责"写入"，__getattribute__ 负责"读取"。
+        写入在前（类定义时），读取在后（访问类属性时），
+        所以 __dict__ 里一定有这个 key。
         """
+        # 绕开自身，直接从 type 拿原始 __dict__
         cls_dict = super().__getattribute__("__dict__")
+        # 从原始字典里取出 Column 映射
         columns = cls_dict.get("__columns__")
         if columns is not None and name in columns:
             return columns[name]
@@ -124,20 +135,22 @@ class Model(BaseModel, metaclass=ModelMeta):
             # 收集新增列和待修改列
             missing: list[str] = []
             modified: list[tuple[str, Any]] = []  # (field_name, IntrospectedColumn)
-            pk_name = cls.__pk__
 
             for field_name, info in cls.__column_info__.items():
                 expected_name = (info.column_name or field_name).lower()
                 matched = existing.get(expected_name)
                 if matched is None:
                     missing.append(field_name)
-                elif field_name != pk_name:
+                else:
                     modified.append((field_name, matched))
 
             if missing or modified:
                 sql = dialect.build_sync_alter(cls, missing, modified)
                 if sql:
                     await dialect.execute(sql, [])
+                # 额外 DDL（如 PG 创建序列）
+                for extra_sql in dialect.build_post_alter(cls, modified):
+                    await dialect.execute(extra_sql, [])
 
         # -- 索引同步（只增不删） --
         existing_indexes = await dialect.introspect_indexes(cls.__table__)

@@ -110,20 +110,6 @@ class PostgreSQLDialect(AbstractDialect):
 
     # -- 执行 ---------------------------------------------------------------
 
-    @staticmethod
-    def _is_connection_error(exc: Exception) -> bool:
-        """PostgreSQL 连接断开类错误。"""
-        try:
-            import asyncpg.exceptions as pg_exc
-        except ImportError:
-            return False
-        return isinstance(
-            exc,
-            pg_exc.ConnectionDoesNotExistError
-            | pg_exc.ConnectionFailureError
-            | pg_exc.InterfaceError,
-        )
-
     def build_insert(self, instance: Model) -> tuple[str, list[Any]]:
         sql, params = super().build_insert(instance)
         pk_col = type(instance).primary_key_column()
@@ -138,40 +124,26 @@ class PostgreSQLDialect(AbstractDialect):
         return None
 
     async def execute(self, sql: str, params: list[Any]) -> Any:
-        """执行写操作，INSERT 返回 lastrowid，其他返回受影响行数。"""
-
-        async def _do() -> Any:
-            if self._tx_conn is not None:
-                return await _run_and_parse(self._tx_conn, sql, params)
-            else:
-                async with self.pool.acquire() as conn:
-                    return await _run_and_parse(conn, sql, params)
-
-        return await self._retry_on_connection_error(_do)
+        if self._tx_conn is not None:
+            return await _run_and_parse(self._tx_conn, sql, params)
+        async with self.pool.acquire() as conn:
+            return await _run_and_parse(conn, sql, params)
 
     async def fetch(self, sql: str, params: list[Any]) -> list[dict[str, Any]]:
-        async def _do() -> list[dict[str, Any]]:
-            if self._tx_conn is not None:
-                rows = await self._tx_conn.fetch(sql, *params)
-                return [dict(row) for row in rows]
-            else:
-                async with self.pool.acquire() as conn:
-                    rows = await conn.fetch(sql, *params)
-                    return [dict(row) for row in rows]
-
-        return await self._retry_on_connection_error(_do)
+        if self._tx_conn is not None:
+            rows = await self._tx_conn.fetch(sql, *params)
+            return [dict(row) for row in rows]
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(sql, *params)
+            return [dict(row) for row in rows]
 
     async def fetchrow(self, sql: str, params: list[Any]) -> dict[str, Any] | None:
-        async def _do() -> dict[str, Any] | None:
-            if self._tx_conn is not None:
-                row = await self._tx_conn.fetchrow(sql, *params)
-                return dict(row) if row is not None else None
-            else:
-                async with self.pool.acquire() as conn:
-                    row = await conn.fetchrow(sql, *params)
-                    return dict(row) if row is not None else None
-
-        return await self._retry_on_connection_error(_do)
+        if self._tx_conn is not None:
+            row = await self._tx_conn.fetchrow(sql, *params)
+            return dict(row) if row is not None else None
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(sql, *params)
+            return dict(row) if row is not None else None
 
     async def close(self) -> None:
         if self._tx_conn is not None:
@@ -182,8 +154,24 @@ class PostgreSQLDialect(AbstractDialect):
 
     # -- DDL ---------------------------------------------------------------
 
+    def _alter_column_type(self, sql_type: str) -> str:
+        """SERIAL/BIGSERIAL 不是真实的 PG 类型，ALTER 时转为底层类型。"""
+        upper = sql_type.upper()
+        if upper == "SERIAL":
+            return "INTEGER"
+        if upper == "BIGSERIAL":
+            return "BIGINT"
+        return sql_type
+
     def map_python_type(self, annotation: Any, column_info: ColumnInfo) -> str:
         if column_info.db_type is not None:
+            db = column_info.db_type.upper()
+            # BIGINT + auto_increment → BIGSERIAL（否则 PG 不会自动生成值）
+            if column_info.auto_increment and column_info.primary_key:
+                if db in ("BIGINT", "INT8"):
+                    return "BIGSERIAL"
+                if db in ("INTEGER", "INT", "INT4"):
+                    return "SERIAL"
             return column_info.db_type
 
         base = resolve_base_type(annotation)
@@ -233,6 +221,37 @@ class PostgreSQLDialect(AbstractDialect):
                 column_default=row.get("column_default"),
             )
             result[col.column_name.lower()] = col
+        return result
+
+    def build_post_alter(
+        self,
+        model: type[Model],
+        modified: list[tuple[str, IntrospectedColumn]],
+    ) -> list[str]:
+        """为 auto_increment 主键创建序列 + SET DEFAULT（PG 升级 BIGINT → BIGSERIAL）。"""
+        result: list[str] = []
+        for field_name, existing in modified:
+            info = model.__column_info__[field_name]
+            if not (info.auto_increment and info.primary_key):
+                continue
+
+            column = model.__columns__[field_name]
+            new_type = self.map_python_type(
+                model.model_fields[field_name].annotation,
+                info,
+            ).upper()
+
+            if new_type not in ("SERIAL", "BIGSERIAL"):
+                continue
+
+            tbl = self.quote_identifier(model.__table__)
+            col = self.quote_identifier(column.column_name)
+            seq_name = f"{model.__table__}_{column.column_name}_seq"
+            seq_quoted = self.quote_identifier(seq_name)
+
+            result.append(f"CREATE SEQUENCE IF NOT EXISTS {seq_quoted} OWNED BY {tbl}.{col}")
+            result.append(f"ALTER TABLE {tbl} ALTER COLUMN {col} SET DEFAULT nextval('{seq_name}')")
+
         return result
 
     async def introspect_indexes(self, table_name: str) -> set[str]:
