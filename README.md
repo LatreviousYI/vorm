@@ -1,27 +1,6 @@
 # eorm
 
-**Async ORM for Python 3.10+** — MySQL and PostgreSQL, powered by Pydantic v2.
-
-```python
-from eorm import Field, Model, connect_mysql
-
-class User(Model):
-    class Meta:
-        table = "users"
-
-    id: int = Field(primary_key=True, auto_increment=True)
-    name: str = Field(max_length=100)
-    age: int | None = None
-
-session = await connect_mysql(host="localhost", user="root", password="", database="test")
-
-user = User(name="Alice", age=30)
-await session.save(user)          # INSERT + id 自动回填
-
-alice = await session.query(User).filter(User.name == "Alice").one()
-await session.query(User).filter(User.age < 18).update(age=0)  # 批量更新
-await session.close()
-```
+**Async ORM for Python 3.10+** — MySQL and PostgreSQL, 基于 Pydantic v2 开发, 以pydantic作为数据模型,同时增加额外字段属性作为数据库字段必要属性,从而可以操作数据库表结构.这个库以精简为主,不提供外键以及多对一,多对多等键功能
 
 ## 特性
 
@@ -45,7 +24,91 @@ pip install eorm
 | 数据库 | 驱动 | 说明 |
 |---|---|---|
 | MySQL | `asyncmy` | 连接池 + 事务 |
-| PostgreSQL | `asyncpg` | 连接池 + 事务 + INSERT RETURNING |
+| PostgreSQL | `asyncpg` | 连接池 + 事务 |
+
+## 字段示例
+```python
+import datetime
+from eorm import Field, Model
+from eorm.ddl import Index
+
+class AllFieldTypes(Model):
+    """覆盖所有 Python 类型 → SQL 类型的映射。"""
+
+    class Meta:
+        table = "all_field_types"
+        indexes = [
+            Index(fields=("short_text",),unique=True),
+            Index(fields=("age","score")) #联合索引
+        ]
+    # 注意: 当数据库中的某个字段值可能为None时, 请在类型后面加上 None类型, 否则反序列化时会报错 例如: short_name :str|None
+    # -- 主键 ---------------------------------------------------------
+    id: int = Field(primary_key=True, auto_increment=True,db_type="bigint")
+    # db_type 当设置了这个值的时候,数据库会直接使用这个值作为类型
+    # MySQL    → `id` INT AUTO_INCREMENT PRIMARY KEY
+    # PG       → "id" SERIAL PRIMARY KEY
+
+    # -- 字符串 -------------------------------------------------------
+
+    short_text: str = Field(max_length=100, nullable=True,default="")
+    # max_length 指定 → VARCHAR(100)
+
+    free_text: str | None = None
+    # 不指定 max_length → TEXT
+
+    # -- 数值 ---------------------------------------------------------
+
+    age: int | None = 0
+    # MySQL → INT,  PG → INTEGER
+
+    score: float = Field(default=0)
+    # MySQL → DOUBLE,  PG → DOUBLE PRECISION
+
+    price: decimal.Decimal | None = Field(default=0.0,db_type="decimal(8,5)")
+    # MySQL → DECIMAL(18,6),  PG → DECIMAL(18,6)
+
+    # -- 布尔 ---------------------------------------------------------
+
+    is_active: bool = Field(default=True)
+    # MySQL → BOOL,  PG → BOOLEAN
+
+    # -- 日期时间 -----------------------------------------------------
+
+    created_at: datetime.datetime = Field(
+        default_factory=datetime.datetime.now,
+        timestamp_behavior="create",  # INSERT 时写入，UPDATE 时跳过
+    )
+    # MySQL → DATETIME,  PG → TIMESTAMP
+
+    updated_at: datetime.datetime = Field(
+        default_factory=datetime.datetime.now,
+        timestamp_behavior="both",  # INSERT / UPDATE 都会刷新
+        index=True
+    )
+
+    event_date: datetime.date | None = None
+    # MySQL → DATE,  PG → DATE
+
+    # -- 二进制 -------------------------------------------------------
+
+    payload: bytes | None = None
+    # MySQL → BLOB,  PG → BYTEA
+
+    # -- JSON ---------------------------------------------------------
+
+    config: dict = Field(default_factory=dict)
+    # MySQL → JSON,  PG → JSONB
+    # DDL: MySQL DEFAULT (JSON_OBJECT()), PG DEFAULT jsonb_build_object()
+
+    tags: list = Field(default_factory=list)
+    # MySQL → JSON,  PG → JSONB
+    # DDL: MySQL DEFAULT (JSON_ARRAY()), PG DEFAULT jsonb_build_array()
+    new_field:list = Field(default_factory=list)
+    
+```
+
+
+
 
 ## 快速开始
 
@@ -61,7 +124,7 @@ class Article(Model):
         table = "articles"
         indexes = [
             Index(fields=("title",)),           # 单列索引
-            Index(fields=("author_id", "created_at")),  # 联合索引
+            Index(fields=("title", "created_at")),  # 联合索引
         ]
 
     id: int = Field(primary_key=True, auto_increment=True)
@@ -82,21 +145,15 @@ class Article(Model):
 ### 2. 连接数据库
 
 ```python
-from eorm import connect_mysql, connect_postgresql
 from eorm.engine import create_mysql_engine, create_postgresql_engine
 
-# Session 直连（一次性操作）
-session = await connect_mysql(host="localhost", user="root", password="", database="test")
+# Mysql 连接池（推荐）
+mysql_engine = await engine.create_mysql_engine(host="127.0.0.1",port=3306,user="username",password="password",database="test",minsize=10,maxsize=20)
+session = mysql_engine.session()
 
-# Engine 连接池（推荐）
-engine = await create_postgresql_engine(host="localhost", user="postgres", password="", database="test")
-session = engine.session()
-
-# PostgreSQL TCP keepalive（OS 层自动检测物理断连）
-engine = await create_postgresql_engine(
-    host="localhost", user="postgres", password="", database="test",
-    keepalives_idle=30, keepalives_interval=10, keepalives_count=3,
-)
+# PostgreSQL 连接池（推荐）
+postgresql_engine = await engine.create_postgresql_engine(host="127.0.0.1",port=3306,user="username",password="password",database="test",min_size=50,max_size=100)
+session = postgresql_engine.session()
 ```
 
 ### 3. 建表 & 索引
@@ -171,6 +228,27 @@ rows = await session.query(Author).join(
 print(rows[0].authors.name)    # 属性
 print(rows[0]["authors.id"])   # 字典 key
 print(dict(rows[0]))           # 扁平字典
+
+# select() 可用于查询指定字段,alias()可用于别名
+d = await mysql_session.query(AllFieldTypes)\
+    .join(JoinTable,on=AllFieldTypes.id==JoinTable.all_id,type="left")\
+    .join(JoinTableSecond,on=JoinTable.id==JoinTableSecond.join_all_id,type="left")\
+    .select(AllFieldTypes.id,AllFieldTypes.short_text,JoinTable.short_text.alias("j_s_t"),JoinTableSecond.short_text.alias("j_ss_t")).all()
+
+class ReturnJoinTableSecond(Model):
+    id: int|None
+
+    short_text: str|None
+
+    j_s_t: str|None
+    
+    j_ss_t:str|None
+
+
+# 后续可以使用pydantic提供的功能反序列化到pydantic模型中
+adapter = TypeAdapter(list[ReturnJoinTableSecond])
+e: list[ReturnJoinTableSecond] = adapter.validate_python(d)
+
 ```
 
 ### 7. 事务 & 健康检查
@@ -282,8 +360,6 @@ uv run ruff check eorm/     # 代码风格
 - **安全 DDL** — 只增不改不删（ADD COLUMN + ALTER COLUMN + CREATE INDEX，不 DROP）
 - **Pydantic 优先** — 模型定义、校验、序列化完全复用 Pydantic 生态
 - **数据库原生优先** — JSON 默认值使用 `JSON_OBJECT()` / `jsonb_build_object()` 等原生函数，不依赖代码序列化
-
-
 
 
 ## License
