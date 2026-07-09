@@ -159,3 +159,119 @@ async def test_dialect_with_owns_pool_closes_pool() -> None:
     assert dialect.closed is False
     await dialect.close()
     assert dialect.closed is True
+
+
+# ---------------------------------------------------------------------------
+# 健康检查 & 重连
+# ---------------------------------------------------------------------------
+
+
+class _PingDialect(AbstractDialect):
+    """支持 ping 模拟的测试方言。"""
+
+    def __init__(self, pool: Any, *, _owns_pool: bool = True, ping_ok: bool = True) -> None:
+        self.pool = pool
+        self._owns_pool = _owns_pool
+        self.ping_ok = ping_ok
+        self.closed = False
+
+    def render_placeholder(self, index: int) -> str:
+        return f"${index}"
+
+    async def begin(self) -> None:
+        pass
+
+    async def commit(self) -> None:
+        pass
+
+    async def rollback(self) -> None:
+        pass
+
+    async def execute(self, sql: str, params: list[Any]) -> Any:
+        return None
+
+    async def execute_insert(self, sql: str, params: list[Any]) -> Any:
+        return None
+
+    async def fetch(self, sql: str, params: list[Any]) -> list[dict[str, Any]]:
+        return []
+
+    async def fetchrow(self, sql: str, params: list[Any]) -> dict[str, Any] | None:
+        return {"ok": 1} if self.ping_ok else None
+
+    async def close(self) -> None:
+        self.closed = True
+
+    def render_json_extract(self, column_sql: str, path: str, as_text: bool) -> str:
+        return column_sql
+
+    def map_python_type(self, annotation: Any, column_info: Any) -> str:
+        return "INTEGER"
+
+    async def introspect_indexes(self, table_name: str) -> set[str]:
+        return set()
+
+    async def introspect_columns(self, table_name: str) -> dict[str, Any]:
+        return {}
+
+
+async def test_engine_ping_healthy() -> None:
+    """Engine.ping() 应返回 True（数据库可达时）。"""
+    eng = Engine(_PingDialect, object(), on_close=lambda: None)
+    ok = await eng.ping()
+    assert ok is True
+
+
+async def test_engine_ping_unhealthy() -> None:
+    """Engine.ping() 应返回 False（数据库不可达时）。"""
+    eng = Engine(_PingDialect, object(), on_close=lambda: None)
+    eng._dialect_class = lambda pool, **kw: _PingDialect(pool, ping_ok=False)  # type: ignore[assignment]
+    ok = await eng.ping()
+    assert ok is False
+
+
+async def test_engine_reconnect_no_factory() -> None:
+    """无 factory 时 reconnect() 返回 False。"""
+    eng = Engine(_PingDialect, object(), on_close=lambda: None)
+    ok = await eng.reconnect()
+    assert ok is False
+
+
+async def test_engine_reconnect_success() -> None:
+    """有 factory 时 reconnect() 应成功更换连接池。"""
+    old_pool = object()
+    new_pool = object()
+    closed_flag: list[bool] = [False]
+
+    async def _factory() -> Any:
+        async def _new_close() -> None:
+            pass
+
+        return new_pool, _new_close
+
+    async def _on_close() -> None:
+        closed_flag[0] = True
+
+    eng = Engine(_PingDialect, old_pool, _on_close, _factory)
+    assert eng._pool is old_pool
+
+    ok = await eng.reconnect()
+    assert ok is True
+    assert closed_flag[0] is True
+    assert eng._pool is new_pool
+
+
+async def test_engine_health_monitor_runs_one_cycle() -> None:
+    """health_monitor 至少运行一个周期不报错。"""
+    eng = Engine(_PingDialect, object(), on_close=lambda: None)
+
+    # 手动跑一个周期来验证逻辑
+    import asyncio
+
+    task = asyncio.ensure_future(eng.health_monitor(interval=0))
+    await asyncio.sleep(0.05)  # 等一个周期完成
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass

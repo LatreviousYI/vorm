@@ -8,6 +8,7 @@ dependencies = [
     "pydantic>=2.0",
     "asyncmy>=0.2",
     "asyncpg>=0.29",
+    "cryptography>=49.0.0",
 ]
 
 [project.optional-dependencies]

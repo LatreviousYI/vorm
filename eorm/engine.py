@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any
@@ -10,11 +11,14 @@ if TYPE_CHECKING:
     from eorm.dialects.mysql import MySQLDialect
     from eorm.dialects.postgresql import PostgreSQLDialect
 
+_PoolFactory = Callable[[], Any]  # async () -> (pool, on_close)
+
 
 class Engine:
     """数据库引擎：持有连接池，按需创建 Session。
 
     Session 共享同一个连接池，各自维护独立的事务状态。
+    支持断线重连——调用 :meth:`reconnect` 或使用 :meth:`health_monitor` 自动检测。
     """
 
     def __init__(
@@ -22,10 +26,12 @@ class Engine:
         dialect_class: type[MySQLDialect | PostgreSQLDialect],
         pool: Any,
         on_close: Callable[[], Any],
+        factory: _PoolFactory | None = None,
     ) -> None:
         self._dialect_class = dialect_class
         self._pool = pool
         self._on_close = on_close
+        self._factory = factory
 
     def session(self) -> Session:
         """基于共享连接池创建一个新 Session。"""
@@ -43,6 +49,53 @@ class Engine:
         """关闭连接池，释放所有连接。"""
         await self._on_close()
 
+    # ------------------------------------------------------------------
+    # 健康检查 & 重连
+    # ------------------------------------------------------------------
+
+    async def ping(self) -> bool:
+        """快捷健康检查。"""
+        session = self.session()
+        return await session.dialect.ping()
+
+    async def reconnect(self) -> bool:
+        """关闭旧连接池，创建新连接池。成功返回 True。"""
+        if self._factory is None:
+            return False
+        # 尽力关掉旧池（可能已经坏了，忽略异常）
+        try:
+            await self._on_close()
+        except Exception:
+            pass
+        try:
+            self._pool, self._on_close = await self._factory()
+            return True
+        except Exception:
+            return False
+
+    async def health_monitor(self, interval: float = 30) -> None:
+        """后台协程：周期 ping，断连自动重连。永不退出。
+
+        用法::
+
+            asyncio.create_task(engine.health_monitor(interval=10))
+        """
+        while True:
+            try:
+                ok = await self.ping()
+            except Exception:
+                ok = False
+
+            if not ok:
+                await self.reconnect()
+
+            await asyncio.sleep(interval)
+
+
+# ---------------------------------------------------------------------------
+# 连接工厂
+# ---------------------------------------------------------------------------
+
 
 async def create_mysql_engine(
     *,
@@ -53,7 +106,10 @@ async def create_mysql_engine(
     database: str | None = None,
     **kwargs: Any,
 ) -> Engine:
-    """创建 MySQL 引擎，连接池在引擎生命周期内复用。"""
+    """创建 MySQL 引擎，连接池在引擎生命周期内复用。
+
+    支持 :meth:`Engine.reconnect` 断线重连。
+    """
     try:
         import asyncmy
     except ImportError:
@@ -73,7 +129,16 @@ async def create_mysql_engine(
         pool.close()
         await pool.wait_closed()
 
-    return Engine(MySQLDialect, pool, _close)
+    async def _factory() -> Any:
+        new_pool = await asyncmy.create_pool(**pool_kwargs)
+
+        async def _new_close() -> None:
+            new_pool.close()
+            await new_pool.wait_closed()
+
+        return new_pool, _new_close
+
+    return Engine(MySQLDialect, pool, _close, _factory)
 
 
 async def create_postgresql_engine(
@@ -85,7 +150,10 @@ async def create_postgresql_engine(
     database: str | None = None,
     **kwargs: Any,
 ) -> Engine:
-    """创建 PostgreSQL 引擎，连接池在引擎生命周期内复用。"""
+    """创建 PostgreSQL 引擎，连接池在引擎生命周期内复用。
+
+    支持 :meth:`Engine.reconnect` 断线重连。
+    """
     try:
         import asyncpg
     except ImportError:
@@ -104,4 +172,12 @@ async def create_postgresql_engine(
     async def _close() -> None:
         await pool.close()
 
-    return Engine(PostgreSQLDialect, pool, _close)
+    async def _factory() -> Any:
+        new_pool = await asyncpg.create_pool(**pool_kwargs)
+
+        async def _new_close() -> None:
+            await new_pool.close()
+
+        return new_pool, _new_close
+
+    return Engine(PostgreSQLDialect, pool, _close, _factory)
