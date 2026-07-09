@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from pydantic import BaseModel, ConfigDict
@@ -11,6 +12,8 @@ from eorm.fields import ColumnInfo, get_column_info
 
 if TYPE_CHECKING:
     from eorm.dialects.base import AbstractDialect
+
+logger = logging.getLogger("eorm")
 
 ModelMetaclass = type(BaseModel)
 
@@ -130,6 +133,7 @@ class Model(BaseModel, metaclass=ModelMeta):
 
         if not existing:
             sql = dialect.build_create_table(cls)
+            logger.info("同步表 %s：创建表", cls.__table__)
             await dialect.execute(sql, [])
         else:
             # 收集新增列和待修改列
@@ -145,14 +149,22 @@ class Model(BaseModel, metaclass=ModelMeta):
                     modified.append((field_name, matched))
 
             if missing or modified:
+                logger.info(
+                    "同步表 %s：新增 %d 列，修改 %d 列",
+                    cls.__table__,
+                    len(missing),
+                    len(modified),
+                )
                 sql = dialect.build_sync_alter(cls, missing, modified)
                 if sql:
                     await dialect.execute(sql, [])
                 # 额外 DDL（如 PG 创建序列）
                 for extra_sql in dialect.build_post_alter(cls, modified):
+                    logger.info("同步表 %s：执行额外 DDL", cls.__table__)
                     await dialect.execute(extra_sql, [])
 
         # -- 索引同步（只增不删） --
         existing_indexes = await dialect.introspect_indexes(cls.__table__)
         for sql in dialect.build_sync_indexes(cls, existing_indexes):
+            logger.info("同步表 %s：创建索引", cls.__table__)
             await dialect.execute(sql, [])

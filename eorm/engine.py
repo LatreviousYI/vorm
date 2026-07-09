@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any
 
 from eorm.session import Session
+
+logger = logging.getLogger("eorm")
 
 if TYPE_CHECKING:
     from eorm.dialects.mysql import MySQLDialect
@@ -56,21 +59,27 @@ class Engine:
     async def ping(self) -> bool:
         """快捷健康检查。"""
         session = self.session()
-        return await session.dialect.ping()
+        ok = await session.dialect.ping()
+        if not ok:
+            logger.warning("健康检查失败：数据库不可达")
+        return ok
 
     async def reconnect(self) -> bool:
         """关闭旧连接池，创建新连接池。成功返回 True。"""
         if self._factory is None:
+            logger.warning("重连失败：未设置工厂函数")
             return False
-        # 尽力关掉旧池（可能已经坏了，忽略异常）
+        logger.info("正在重连数据库...")
         try:
             await self._on_close()
         except Exception:
             pass
         try:
             self._pool, self._on_close = await self._factory()
+            logger.info("数据库重连成功")
             return True
-        except Exception:
+        except Exception as exc:
+            logger.error("数据库重连失败：%s", exc)
             return False
 
     async def health_monitor(self, interval: float = 30) -> None:
@@ -80,10 +89,12 @@ class Engine:
 
             asyncio.create_task(engine.health_monitor(interval=10))
         """
+        logger.info("健康监控已启动，间隔 %ss", interval)
         while True:
             try:
                 ok = await self.ping()
-            except Exception:
+            except Exception as exc:
+                logger.warning("Ping 异常：%s", exc)
                 ok = False
 
             if not ok:

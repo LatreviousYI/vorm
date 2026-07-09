@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import decimal
+import logging
 from typing import Any, cast
 
 import asyncmy
@@ -9,6 +10,8 @@ import asyncmy
 from eorm.ddl import IntrospectedColumn, resolve_base_type
 from eorm.dialects.base import AbstractDialect
 from eorm.fields import ColumnInfo
+
+logger = logging.getLogger("eorm")
 
 
 class MySQLDialect(AbstractDialect):
@@ -55,6 +58,7 @@ class MySQLDialect(AbstractDialect):
     # -- 执行 ---------------------------------------------------------------
 
     async def execute(self, sql: str, params: list[Any]) -> Any:
+        logger.debug("SQL: %s | params: %s", sql, params)
         if self._tx_conn is not None:
             async with self._tx_conn.cursor() as cursor:
                 await cursor.execute(sql, params)
@@ -66,6 +70,7 @@ class MySQLDialect(AbstractDialect):
                 return cursor.rowcount
 
     async def execute_insert(self, sql: str, params: list[Any]) -> Any:
+        logger.debug("SQL: %s | params: %s", sql, params)
         if self._tx_conn is not None:
             async with self._tx_conn.cursor() as cursor:
                 await cursor.execute(sql, params)
@@ -77,6 +82,7 @@ class MySQLDialect(AbstractDialect):
                 return cursor.lastrowid
 
     async def fetch(self, sql: str, params: list[Any]) -> list[dict[str, Any]]:
+        logger.debug("SQL: %s | params: %s", sql, params)
         if self._tx_conn is not None:
             async with self._tx_conn.cursor(asyncmy.cursors.DictCursor) as cursor:
                 await cursor.execute(sql, params)
@@ -87,6 +93,7 @@ class MySQLDialect(AbstractDialect):
                 return list(await cursor.fetchall())
 
     async def fetchrow(self, sql: str, params: list[Any]) -> dict[str, Any] | None:
+        logger.debug("SQL: %s | params: %s", sql, params)
         if self._tx_conn is not None:
             async with self._tx_conn.cursor(asyncmy.cursors.DictCursor) as cursor:
                 await cursor.execute(sql, params)

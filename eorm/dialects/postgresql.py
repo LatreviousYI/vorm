@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import decimal
+import logging
 import re
 from typing import TYPE_CHECKING, Any
 
@@ -13,6 +14,8 @@ from eorm.fields import ColumnInfo
 
 if TYPE_CHECKING:
     from eorm.model import Model
+
+logger = logging.getLogger("eorm")
 
 
 def _parse_rowcount(status: str) -> int:
@@ -124,12 +127,14 @@ class PostgreSQLDialect(AbstractDialect):
         return None
 
     async def execute(self, sql: str, params: list[Any]) -> Any:
+        logger.debug("SQL: %s | params: %s", sql, params)
         if self._tx_conn is not None:
             return await _run_and_parse(self._tx_conn, sql, params)
         async with self.pool.acquire() as conn:
             return await _run_and_parse(conn, sql, params)
 
     async def fetch(self, sql: str, params: list[Any]) -> list[dict[str, Any]]:
+        logger.debug("SQL: %s | params: %s", sql, params)
         if self._tx_conn is not None:
             rows = await self._tx_conn.fetch(sql, *params)
             return [dict(row) for row in rows]
@@ -138,6 +143,7 @@ class PostgreSQLDialect(AbstractDialect):
             return [dict(row) for row in rows]
 
     async def fetchrow(self, sql: str, params: list[Any]) -> dict[str, Any] | None:
+        logger.debug("SQL: %s | params: %s", sql, params)
         if self._tx_conn is not None:
             row = await self._tx_conn.fetchrow(sql, *params)
             return dict(row) if row is not None else None

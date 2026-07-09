@@ -193,10 +193,22 @@ await session.execute_raw("DELETE FROM users WHERE status = %s", ["inactive"])
 rows = await session.fetch_raw("SELECT id, name FROM users WHERE age > %s", [18])
 row = await session.fetch_one_raw("SELECT * FROM users WHERE id = %s", [1])
 ```
+## 查看日志
+```
+import logging
 
-### 9. 断连自动重试
+# 看所有 SQL 语句
+logging.getLogger("eorm").setLevel(logging.DEBUG)
 
-查询过程中连接断开时自动重试（最多 3 次，指数退避 0.3s → 0.6s → 1.2s）。MySQL 识别 `OperationalError`，PostgreSQL 识别 `ConnectionDoesNotExistError` / `ConnectionFailureError` / `InterfaceError`。非连接错误不重试直接抛出。
+# 只看 DDL 和重连信息
+logging.getLogger("eorm").setLevel(logging.INFO)
+
+# 配置输出格式
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+```
 
 ## 模型定义参考
 
@@ -270,6 +282,9 @@ uv run ruff check eorm/     # 代码风格
 - **安全 DDL** — 只增不改不删（ADD COLUMN + ALTER COLUMN + CREATE INDEX，不 DROP）
 - **Pydantic 优先** — 模型定义、校验、序列化完全复用 Pydantic 生态
 - **数据库原生优先** — JSON 默认值使用 `JSON_OBJECT()` / `jsonb_build_object()` 等原生函数，不依赖代码序列化
+
+
+
 
 ## License
 
