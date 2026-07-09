@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from pydantic import BaseModel, ConfigDict
 
-from eorm.ddl import Index
+from eorm.ddl import Index, resolve_base_type
 from eorm.exceptions import ModelDefinitionError
 from eorm.expression import Column
 from eorm.fields import ColumnInfo, get_column_info
@@ -52,6 +52,14 @@ class ModelMeta(ModelMetaclass):
         cls.__columns__ = columns
         cls.__column_info__ = column_info
         cls.__pk__ = pk_name
+
+        # 预计算 JSON 字段名集合，避免运行时逐行逐字段解析 annotation
+        json_fields: set[str] = set()
+        for field_name, field_info in cls.model_fields.items():
+            base = resolve_base_type(field_info.annotation)
+            if base in (dict, list):
+                json_fields.add(field_name)
+        cls.__json_fields__ = frozenset(json_fields)
 
         # -- 索引 -------------------------------------------------------
         indexes: list[Index] = []
@@ -102,6 +110,7 @@ class Model(BaseModel, metaclass=ModelMeta):
     __column_info__: ClassVar[dict[str, ColumnInfo]]
     __pk__: ClassVar[str | None]
     __indexes__: ClassVar[list[Index]]
+    __json_fields__: ClassVar[frozenset[str]]
 
     @classmethod
     def table_name(cls) -> str:

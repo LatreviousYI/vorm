@@ -37,12 +37,12 @@ class Row:
     def __init__(self, raw: dict[str, Any], table_names: list[str]) -> None:
         object.__setattr__(self, "_raw", raw)
         tables: dict[str, dict[str, Any]] = {t: {} for t in table_names}
+        # 预建 prefix → table 映射，避免内层循环每次做 f-string 拼接
+        prefix_map = {f"{t}_": t for t in table_names}
         for key, value in raw.items():
-            for table in table_names:
-                prefix = f"{table}_"
+            for prefix, table in prefix_map.items():
                 if key.startswith(prefix):
-                    field = key[len(prefix) :]
-                    tables[table][field] = value
+                    tables[table][key[len(prefix) :]] = value
                     break
         object.__setattr__(self, "_tables", tables)
 

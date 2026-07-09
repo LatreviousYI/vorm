@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json as _json_mod
-import typing as _typing
 from dataclasses import dataclass
 from typing import Any, Generic, TypeVar, cast
 
@@ -11,19 +10,6 @@ from eorm.model import Model
 from eorm.row import Row
 
 ModelT = TypeVar("ModelT", bound=Model)
-
-
-def _resolve_annotation_base(annotation: Any) -> type:
-    """Unwrap Optional[X] and parameterised generics to return the base type."""
-    args = _typing.get_args(annotation)
-    if args:
-        non_none = [a for a in args if a is not type(None)]
-        if len(non_none) == 1:
-            return non_none[0]
-    origin = _typing.get_origin(annotation)
-    if origin is not None:
-        return origin
-    return annotation
 
 
 @dataclass
@@ -127,12 +113,11 @@ class QuerySet(Generic[ModelT]):
             return [Row(row, table_names) for row in rows]  # type: ignore[return-value]
 
         # 将 JSON 字符串反序列化为 Python 对象再交给 Pydantic 校验
-        for row in rows:
-            for field_name, field_info in self.model.model_fields.items():
-                annotation = field_info.annotation
-                base = _resolve_annotation_base(annotation)
-                if base in (dict, list) and field_name in row:
-                    val = row[field_name]
+        json_fields = self.model.__json_fields__
+        if json_fields:
+            for row in rows:
+                for field_name in json_fields:
+                    val = row.get(field_name)
                     if isinstance(val, str):
                         try:
                             row[field_name] = _json_mod.loads(val)
