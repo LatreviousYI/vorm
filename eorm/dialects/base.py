@@ -243,6 +243,8 @@ class AbstractDialect(ABC):
             else:
                 value = getattr(instance, field_name)
 
+            if isinstance(value, dict | list):
+                value = _json_mod.dumps(value)
             params.append(value)
             col_sql = self.quote_identifier(column.column_name)
             placeholder = self.render_placeholder(len(params))
