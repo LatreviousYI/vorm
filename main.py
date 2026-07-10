@@ -1,5 +1,5 @@
 def main():
-    print("Hello from eorm!")
+    print("Hello from vorm!")
 
 
 if __name__ == "__main__":

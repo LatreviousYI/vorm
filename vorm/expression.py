@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from eorm.dialects.base import AbstractDialect
+    from vorm.dialects.base import AbstractDialect
 
 
 @dataclass(frozen=True)

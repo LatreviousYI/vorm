@@ -7,11 +7,11 @@ from typing import Any, cast
 
 import asyncmy
 
-from eorm.ddl import IntrospectedColumn, resolve_base_type
-from eorm.dialects.base import AbstractDialect
-from eorm.fields import ColumnInfo
+from vorm.ddl import IntrospectedColumn, resolve_base_type
+from vorm.dialects.base import AbstractDialect
+from vorm.fields import ColumnInfo
 
-logger = logging.getLogger("eorm")
+logger = logging.getLogger("vorm")
 
 
 class MySQLDialect(AbstractDialect):
@@ -255,7 +255,7 @@ class MySQLDialect(AbstractDialect):
 
     def _render_json_default_expr(self, value: Any) -> str:
         """MySQL 使用 ``JSON_OBJECT`` / ``JSON_ARRAY`` 原生函数。"""
-        from eorm.dialects.base import _render_json_default_expr
+        from vorm.dialects.base import _render_json_default_expr
 
         return _render_json_default_expr(value, "JSON_OBJECT", "JSON_ARRAY")
 

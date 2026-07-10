@@ -1,5 +1,5 @@
 [project]
-name = "eorm"
+name = "vorm"
 version = "0.1.0"
 description = "Async ORM for MySQL and PostgreSQL, powered by Pydantic v2"
 readme = "README.md"

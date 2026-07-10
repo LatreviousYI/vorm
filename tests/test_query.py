@@ -4,9 +4,9 @@ from typing import Any
 
 import pytest
 
-from eorm import Field, Model, Session
-from eorm.dialects.base import AbstractDialect
-from eorm.exceptions import DoesNotExist, MultipleObjectsReturned
+from vorm import Field, Model, Session
+from vorm.dialects.base import AbstractDialect
+from vorm.exceptions import DoesNotExist, MultipleObjectsReturned
 
 
 class ConfigurableDialect(AbstractDialect):
@@ -353,7 +353,7 @@ async def test_join_all_returns_row_objects(
     session: Session, dialect: ConfigurableDialect, join_rows: list[dict[str, Any]]
 ) -> None:
     """带 JOIN 的查询 .all() 应返回 Row 对象，而非 Model 实例。"""
-    from eorm.row import Row
+    from vorm.row import Row
 
     dialect.fetch_rows = join_rows
 
@@ -367,7 +367,7 @@ async def test_join_row_table_attr_access(
     session: Session, dialect: ConfigurableDialect, join_rows: list[dict[str, Any]]
 ) -> None:
     """Row 对象支持 row.users.name 形式的属性访问。"""
-    from eorm.row import RowSnapshot
+    from vorm.row import RowSnapshot
 
     dialect.fetch_rows = join_rows
 
@@ -415,7 +415,7 @@ async def test_join_first(
     session: Session, dialect: ConfigurableDialect, join_rows: list[dict[str, Any]]
 ) -> None:
     """.first() 配合 JOIN 应返回单个 Row。"""
-    from eorm.row import Row
+    from vorm.row import Row
 
     dialect.fetch_rows = [join_rows[0]]
 
@@ -430,7 +430,7 @@ async def test_join_one(
     session: Session, dialect: ConfigurableDialect, join_rows: list[dict[str, Any]]
 ) -> None:
     """.one() 配合 JOIN 应返回单个 Row。"""
-    from eorm.row import Row
+    from vorm.row import Row
 
     dialect.fetch_rows = [join_rows[0]]
 
@@ -442,7 +442,7 @@ async def test_join_one(
 
 async def test_join_three_tables(session: Session, dialect: ConfigurableDialect) -> None:
     """三表 JOIN 的 Row 应包含三张表的字段。"""
-    from eorm.row import Row, RowSnapshot
+    from vorm.row import Row, RowSnapshot
 
     dialect.fetch_rows = [
         {

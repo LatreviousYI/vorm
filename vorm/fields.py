@@ -78,8 +78,8 @@ def Field(
     if json_schema_extra is None:
         json_schema_extra = {}
     if not isinstance(json_schema_extra, dict):
-        raise TypeError("eorm.Field only supports dict json_schema_extra")
-    json_schema_extra = {**json_schema_extra, "eorm_column": column_info}
+        raise TypeError("vorm.Field only supports dict json_schema_extra")
+    json_schema_extra = {**json_schema_extra, "vorm_column": column_info}
     if default is PydanticUndefined:
         return cast(
             Any,
@@ -104,7 +104,7 @@ def get_column_info(field_info: _pydantic_fields.FieldInfo) -> ColumnInfo | None
         if isinstance(item, ColumnInfo):
             return item
     if isinstance(field_info.json_schema_extra, dict):
-        item = field_info.json_schema_extra.get("eorm_column")
+        item = field_info.json_schema_extra.get("vorm_column")
         if isinstance(item, ColumnInfo):
             return item
     return None

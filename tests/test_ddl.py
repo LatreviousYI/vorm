@@ -5,10 +5,10 @@ from typing import Any
 
 import pytest
 
-from eorm import Field, Model, Session
-from eorm.ddl import Index, IntrospectedColumn
-from eorm.dialects.base import AbstractDialect
-from eorm.fields import ColumnInfo
+from vorm import Field, Model, Session
+from vorm.ddl import Index, IntrospectedColumn
+from vorm.dialects.base import AbstractDialect
+from vorm.fields import ColumnInfo
 
 # ---------------------------------------------------------------------------
 # 测试方言
@@ -59,7 +59,7 @@ class DDLDialect(AbstractDialect):
         if column_info.db_type is not None:
             return column_info.db_type
 
-        from eorm.ddl import resolve_base_type
+        from vorm.ddl import resolve_base_type
 
         base = resolve_base_type(annotation)
         if base is int:

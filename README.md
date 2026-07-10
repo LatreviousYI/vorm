@@ -1,4 +1,4 @@
-# eorm
+# vorm
 
 **Async ORM for Python 3.10+** — MySQL and PostgreSQL, 基于 Pydantic v2 开发, 以pydantic作为数据模型,同时增加额外字段属性作为数据库字段必要属性,从而可以操作数据库表结构.这个库以精简为主,不提供外键以及多对一,多对多等键功能
 
@@ -18,7 +18,7 @@
 ## 安装
 
 ```bash
-pip install eorm
+pip install vorm
 ```
 
 | 数据库 | 驱动 | 说明 |
@@ -29,8 +29,8 @@ pip install eorm
 ## 字段示例
 ```python
 import datetime
-from eorm import Field, Model
-from eorm.ddl import Index
+from vorm import Field, Model
+from vorm.ddl import Index
 
 class AllFieldTypes(Model):
     """覆盖所有 Python 类型 → SQL 类型的映射。"""
@@ -116,8 +116,8 @@ class AllFieldTypes(Model):
 
 ```python
 import datetime
-from eorm import Field, Model
-from eorm.ddl import Index
+from vorm import Field, Model
+from vorm.ddl import Index
 
 class Article(Model):
     class Meta:
@@ -145,7 +145,7 @@ class Article(Model):
 ### 2. 连接数据库
 
 ```python
-from eorm.engine import create_mysql_engine, create_postgresql_engine
+from vorm.engine import create_mysql_engine, create_postgresql_engine
 
 # Mysql 连接池（推荐）
 mysql_engine = await engine.create_mysql_engine(host="127.0.0.1",port=3306,user="username",password="password",database="test",minsize=10,maxsize=20)
@@ -276,10 +276,10 @@ row = await session.fetch_one_raw("SELECT * FROM users WHERE id = %s", [1])
 import logging
 
 # 看所有 SQL 语句
-logging.getLogger("eorm").setLevel(logging.DEBUG)
+logging.getLogger("vorm").setLevel(logging.DEBUG)
 
 # 只看 DDL 和重连信息
-logging.getLogger("eorm").setLevel(logging.INFO)
+logging.getLogger("vorm").setLevel(logging.INFO)
 
 # 配置输出格式
 logging.basicConfig(
@@ -349,8 +349,8 @@ class Meta:
 ```bash
 uv sync                     # 安装依赖
 uv run pytest               # 运行测试（112 个）
-uv run mypy eorm/           # 类型检查
-uv run ruff check eorm/     # 代码风格
+uv run mypy vorm/           # 类型检查
+uv run ruff check vorm/     # 代码风格
 ```
 
 ## 设计原则

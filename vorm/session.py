@@ -4,10 +4,10 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 
-from eorm.dialects.mysql import create_mysql_dialect
-from eorm.dialects.postgresql import create_postgresql_dialect
-from eorm.model import Model
-from eorm.query import ModelT, QuerySet
+from vorm.dialects.mysql import create_mysql_dialect
+from vorm.dialects.postgresql import create_postgresql_dialect
+from vorm.model import Model
+from vorm.query import ModelT, QuerySet
 
 
 class Session:

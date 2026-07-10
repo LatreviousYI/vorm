@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from eorm import Field, Model
+from vorm import Field, Model
 
 
 class User(Model):
@@ -29,7 +29,7 @@ def test_auto_increment_primary_key_defaults_to_none() -> None:
 
 def test_class_level_field_access_returns_column() -> None:
     """类级别访问字段名应返回 Column 对象，用于构建表达式。"""
-    from eorm.expression import Column as ColumnCls
+    from vorm.expression import Column as ColumnCls
 
     assert isinstance(User.name, ColumnCls)
     assert User.name.field_name == "name"
@@ -39,7 +39,7 @@ def test_class_level_field_access_returns_column() -> None:
 
 def test_class_level_field_expression_works() -> None:
     """类级别表达式（如 User.name == 'Alice'）应返回 BinaryExpression。"""
-    from eorm.expression import BinaryExpression
+    from vorm.expression import BinaryExpression
 
     expr = User.name == "Alice"
     assert isinstance(expr, BinaryExpression)
@@ -50,7 +50,7 @@ def test_class_level_field_expression_works() -> None:
 
 def test_instance_field_access_returns_value_not_column() -> None:
     """实例访问字段应返回实际值，而不是 Column。"""
-    from eorm.expression import Column as ColumnCls
+    from vorm.expression import Column as ColumnCls
 
     user = User(name="Alice", email="alice@example.com", age=30)
     assert user.name == "Alice"

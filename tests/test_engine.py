@@ -4,8 +4,8 @@ from typing import Any
 
 import pytest
 
-from eorm import Engine, Session
-from eorm.dialects.base import AbstractDialect
+from vorm import Engine, Session
+from vorm.dialects.base import AbstractDialect
 
 
 class _TestDialect(AbstractDialect):

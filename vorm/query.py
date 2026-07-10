@@ -4,10 +4,10 @@ import json as _json_mod
 from dataclasses import dataclass
 from typing import Any, Generic, TypeVar, cast
 
-from eorm.exceptions import DoesNotExist, MultipleObjectsReturned
-from eorm.expression import AliasedColumn, Column, Expression, OrderExpression
-from eorm.model import Model
-from eorm.row import Row
+from vorm.exceptions import DoesNotExist, MultipleObjectsReturned
+from vorm.expression import AliasedColumn, Column, Expression, OrderExpression
+from vorm.model import Model
+from vorm.row import Row
 
 ModelT = TypeVar("ModelT", bound=Model)
 

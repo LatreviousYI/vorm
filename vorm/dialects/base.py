@@ -6,12 +6,12 @@ import re
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any
 
-from eorm.fields import ColumnInfo
+from vorm.fields import ColumnInfo
 
 if TYPE_CHECKING:
-    from eorm.ddl import IntrospectedColumn
-    from eorm.model import Model
-    from eorm.query import QuerySet
+    from vorm.ddl import IntrospectedColumn
+    from vorm.model import Model
+    from vorm.query import QuerySet
 
 
 # ------------------------------------------------------------------

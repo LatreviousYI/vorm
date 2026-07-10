@@ -9,7 +9,7 @@ wheels/
 # Virtual environments
 .venv
 .vscode
-
+.pypirc
 examples/
 
 CLAUDE.md

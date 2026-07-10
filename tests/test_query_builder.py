@@ -4,8 +4,8 @@ from typing import Any
 
 import pytest
 
-from eorm import Field, Model, Session
-from eorm.dialects.base import AbstractDialect
+from vorm import Field, Model, Session
+from vorm.dialects.base import AbstractDialect
 
 
 class DummyDialect(AbstractDialect):
@@ -186,7 +186,7 @@ def test_build_delete_by_query_no_filter(session: Session) -> None:
 
 def test_pg_build_insert_includes_returning() -> None:
     """PostgreSQL 的 build_insert 应在语句末尾追加 RETURNING 主键列。"""
-    from eorm.dialects.postgresql import PostgreSQLDialect
+    from vorm.dialects.postgresql import PostgreSQLDialect
 
     dialect = PostgreSQLDialect(pool=None)  # type: ignore[arg-type]  # 仅测 SQL 生成，不连库
     user = User(name="Alice", age=25)

@@ -8,14 +8,14 @@ from typing import TYPE_CHECKING, Any
 
 import asyncpg
 
-from eorm.ddl import IntrospectedColumn, resolve_base_type
-from eorm.dialects.base import AbstractDialect
-from eorm.fields import ColumnInfo
+from vorm.ddl import IntrospectedColumn, resolve_base_type
+from vorm.dialects.base import AbstractDialect
+from vorm.fields import ColumnInfo
 
 if TYPE_CHECKING:
-    from eorm.model import Model
+    from vorm.model import Model
 
-logger = logging.getLogger("eorm")
+logger = logging.getLogger("vorm")
 
 
 def _parse_rowcount(status: str) -> int:

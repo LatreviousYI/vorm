@@ -5,15 +5,15 @@ from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from pydantic import BaseModel, ConfigDict
 
-from eorm.ddl import Index, resolve_base_type
-from eorm.exceptions import ModelDefinitionError
-from eorm.expression import Column
-from eorm.fields import ColumnInfo, get_column_info
+from vorm.ddl import Index, resolve_base_type
+from vorm.exceptions import ModelDefinitionError
+from vorm.expression import Column
+from vorm.fields import ColumnInfo, get_column_info
 
 if TYPE_CHECKING:
-    from eorm.dialects.base import AbstractDialect
+    from vorm.dialects.base import AbstractDialect
 
-logger = logging.getLogger("eorm")
+logger = logging.getLogger("vorm")
 
 ModelMetaclass = type(BaseModel)
 

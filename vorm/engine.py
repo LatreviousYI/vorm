@@ -6,13 +6,13 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any
 
-from eorm.session import Session
+from vorm.session import Session
 
-logger = logging.getLogger("eorm")
+logger = logging.getLogger("vorm")
 
 if TYPE_CHECKING:
-    from eorm.dialects.mysql import MySQLDialect
-    from eorm.dialects.postgresql import PostgreSQLDialect
+    from vorm.dialects.mysql import MySQLDialect
+    from vorm.dialects.postgresql import PostgreSQLDialect
 
 _PoolFactory = Callable[[], Any]  # async () -> (pool, on_close)
 
@@ -128,7 +128,7 @@ async def create_mysql_engine(
             "MySQL support requires the 'asyncmy' package. Install with: pip install asyncmy"
         ) from None
 
-    from eorm.dialects.mysql import MySQLDialect
+    from vorm.dialects.mysql import MySQLDialect
 
     pool_kwargs: dict[str, Any] = {"host": host, "port": port, "user": user, "password": password}
     if database is not None:
@@ -172,7 +172,7 @@ async def create_postgresql_engine(
             "PostgreSQL support requires the 'asyncpg' package. Install with: pip install asyncpg"
         ) from None
 
-    from eorm.dialects.postgresql import PostgreSQLDialect
+    from vorm.dialects.postgresql import PostgreSQLDialect
 
     pool_kwargs: dict[str, Any] = {"host": host, "port": port, "user": user, "password": password}
     if database is not None:

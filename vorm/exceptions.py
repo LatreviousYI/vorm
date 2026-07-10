@@ -1,15 +1,15 @@
 from __future__ import annotations
 
 
-class EormError(Exception):
-    """Base exception for eorm."""
+class VormError(Exception):
+    """Base exception for vorm."""
 
 
-class ModelDefinitionError(EormError):
+class ModelDefinitionError(VormError):
     """Raised when a model definition cannot be mapped to a table."""
 
 
-class QueryError(EormError):
+class QueryError(VormError):
     """Raised when a query cannot be built or executed."""
 
 
