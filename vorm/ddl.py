@@ -30,6 +30,7 @@ class IntrospectedColumn:
     data_type: str
     is_nullable: bool
     column_default: str | None = None
+    column_comment: str | None = None
 
 
 def resolve_base_type(annotation: Any) -> type:

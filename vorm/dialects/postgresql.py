@@ -160,6 +160,21 @@ class PostgreSQLDialect(AbstractDialect):
 
     # -- DDL ---------------------------------------------------------------
 
+    def _normalize_type(self, db_type: str) -> str:
+        """PG: 归一化类型名，处理别名。
+
+        ``integer`` → ``int``, ``character varying`` → ``varchar`` 等。
+        保留类型参数（如 ``varchar(100)``, ``numeric(10,2)``），用于长度/精度变更检测。
+        """
+        t = db_type.lower().strip()
+        t = t.replace("integer", "int")
+        t = t.replace("boolean", "bool")
+        t = t.replace("character varying", "varchar")
+        t = t.replace("double precision", "double")
+        t = t.replace("timestamp without time zone", "timestamp")
+        t = t.replace("timestamp with time zone", "timestamptz")
+        return t
+
     def _alter_column_type(self, sql_type: str) -> str:
         """SERIAL/BIGSERIAL 不是真实的 PG 类型，ALTER 时转为底层类型。"""
         upper = sql_type.upper()
@@ -218,6 +233,20 @@ class PostgreSQLDialect(AbstractDialect):
             "ORDER BY ordinal_position"
         )
         rows = await self.fetch(query, [table_name])
+
+        # Fetch column comments from pg_catalog
+        comment_query = (
+            "SELECT a.attname AS column_name, "
+            "pg_catalog.col_description(c.oid, a.attnum) AS column_comment "
+            "FROM pg_catalog.pg_class c "
+            "JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid "
+            "WHERE c.relname = $1 AND a.attnum > 0 AND NOT a.attisdropped"
+        )
+        comment_rows = await self.fetch(comment_query, [table_name])
+        comment_map: dict[str, str | None] = {}
+        for row in comment_rows:
+            comment_map[row["column_name"]] = row.get("column_comment")
+
         result: dict[str, IntrospectedColumn] = {}
         for row in rows:
             col = IntrospectedColumn(
@@ -225,18 +254,55 @@ class PostgreSQLDialect(AbstractDialect):
                 data_type=row["data_type"],
                 is_nullable=row["is_nullable"] == "YES",
                 column_default=row.get("column_default"),
+                column_comment=comment_map.get(row["column_name"]),
             )
             result[col.column_name.lower()] = col
+        return result
+
+    def build_post_create(self, model: type[Model]) -> list[str]:
+        """Generate COMMENT ON COLUMN for all columns that have a comment."""
+        result: list[str] = []
+        tbl = self.quote_identifier(model.__table__)
+        for field_name, info in model.__column_info__.items():
+            if not info.comment:
+                continue
+            col = self.quote_identifier(model.__columns__[field_name].column_name)
+            escaped = info.comment.replace("'", "''")
+            result.append(f"COMMENT ON COLUMN {tbl}.{col} IS '{escaped}'")
         return result
 
     def build_post_alter(
         self,
         model: type[Model],
         modified: list[tuple[str, IntrospectedColumn]],
+        add_fields: list[str] | None = None,
     ) -> list[str]:
-        """为 auto_increment 主键创建序列 + SET DEFAULT（PG 升级 BIGINT → BIGSERIAL）。"""
+        """为 auto_increment 主键创建序列 + 处理列注释变更。"""
         result: list[str] = []
+        tbl = self.quote_identifier(model.__table__)
+
+        # COMMENT ON COLUMN for newly added columns
+        if add_fields:
+            for field_name in add_fields:
+                info = model.__column_info__[field_name]
+                if info.comment:
+                    col = self.quote_identifier(model.__columns__[field_name].column_name)
+                    escaped = info.comment.replace("'", "''")
+                    result.append(f"COMMENT ON COLUMN {tbl}.{col} IS '{escaped}'")
+
+        # COMMENT ON COLUMN for modified columns (comment added/changed/removed)
         for field_name, existing in modified:
+            if self._comment_changed(model, field_name, existing):
+                info = model.__column_info__[field_name]
+                col = self.quote_identifier(model.__columns__[field_name].column_name)
+                if info.comment:
+                    escaped = info.comment.replace("'", "''")
+                    result.append(f"COMMENT ON COLUMN {tbl}.{col} IS '{escaped}'")
+                else:
+                    result.append(f"COMMENT ON COLUMN {tbl}.{col} IS NULL")
+
+        # 为 auto_increment 主键创建序列 + SET DEFAULT（PG 升级 BIGINT → BIGSERIAL）
+        for field_name, _existing in modified:
             info = model.__column_info__[field_name]
             if not (info.auto_increment and info.primary_key):
                 continue
@@ -250,7 +316,6 @@ class PostgreSQLDialect(AbstractDialect):
             if new_type not in ("SERIAL", "BIGSERIAL"):
                 continue
 
-            tbl = self.quote_identifier(model.__table__)
             col = self.quote_identifier(column.column_name)
             seq_name = f"{model.__table__}_{column.column_name}_seq"
             seq_quoted = self.quote_identifier(seq_name)

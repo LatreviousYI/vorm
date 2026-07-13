@@ -84,6 +84,50 @@ class DDLDialect(AbstractDialect):
             return "JSONB"
         return "TEXT"
 
+    def build_post_create(self, model: type[Model]) -> list[str]:
+        """PG 风格：生成 COMMENT ON COLUMN 语句。"""
+        result: list[str] = []
+        tbl = self.quote_identifier(model.__table__)
+        for field_name, info in model.__column_info__.items():
+            if not info.comment:
+                continue
+            col = self.quote_identifier(model.__columns__[field_name].column_name)
+            escaped = info.comment.replace("'", "''")
+            result.append(f"COMMENT ON COLUMN {tbl}.{col} IS '{escaped}'")
+        return result
+
+    def build_post_alter(
+        self,
+        model: type[Model],
+        modified: list[tuple[str, IntrospectedColumn]],
+        add_fields: list[str] | None = None,
+    ) -> list[str]:
+        """PG 风格：处理 COMMENT ON COLUMN（新增列和注释变更）。"""
+        result: list[str] = []
+        tbl = self.quote_identifier(model.__table__)
+
+        # COMMENT ON COLUMN for newly added columns
+        if add_fields:
+            for field_name in add_fields:
+                info = model.__column_info__[field_name]
+                if info.comment:
+                    col = self.quote_identifier(model.__columns__[field_name].column_name)
+                    escaped = info.comment.replace("'", "''")
+                    result.append(f"COMMENT ON COLUMN {tbl}.{col} IS '{escaped}'")
+
+        # COMMENT ON COLUMN for modified columns
+        for field_name, existing in modified:
+            if self._comment_changed(model, field_name, existing):
+                info = model.__column_info__[field_name]
+                col = self.quote_identifier(model.__columns__[field_name].column_name)
+                if info.comment:
+                    escaped = info.comment.replace("'", "''")
+                    result.append(f"COMMENT ON COLUMN {tbl}.{col} IS '{escaped}'")
+                else:
+                    result.append(f"COMMENT ON COLUMN {tbl}.{col} IS NULL")
+
+        return result
+
     async def introspect_indexes(self, table_name: str) -> set[str]:
         return set()
 
@@ -836,3 +880,300 @@ def test_build_sync_indexes_for_field_index(dialect: DDLDialect) -> None:
     sqls = dialect.build_sync_indexes(FieldIndexModel, existing_names=set())
     assert len(sqls) == 1
     assert "ix_field_index_email" in sqls[0]
+
+
+# ---------------------------------------------------------------------------
+# 列注释测试模型
+# ---------------------------------------------------------------------------
+
+
+class CommentModel(Model):
+    """带列注释的模型，用于测试 COMMENT DDL 生成。"""
+
+    class Meta:
+        table = "comment_test"
+
+    id: int = Field(primary_key=True, auto_increment=True)
+    name: str = Field(max_length=100, comment="User display name")
+    email: str = Field(comment="Email address")
+    bio: str | None = None  # 无注释
+
+
+# ---------------------------------------------------------------------------
+# PG 风格 COMMENT ON COLUMN SQL 生成测试
+# ---------------------------------------------------------------------------
+
+
+def test_build_post_create_comment(dialect: DDLDialect) -> None:
+    """build_post_create 应为有 comment 的列生成 COMMENT ON COLUMN 语句。"""
+    sqls = dialect.build_post_create(CommentModel)
+
+    assert len(sqls) == 2
+    assert 'COMMENT ON COLUMN "comment_test"."name" IS' in sqls[0]
+    assert "User display name" in sqls[0]
+    assert 'COMMENT ON COLUMN "comment_test"."email" IS' in sqls[1]
+    assert "Email address" in sqls[1]
+
+
+def test_build_post_create_no_comment_model(dialect: DDLDialect) -> None:
+    """没有注释的模型 build_post_create 应返回空列表。"""
+    sqls = dialect.build_post_create(User)
+    assert sqls == []
+
+
+def test_build_create_table_without_comment(dialect: DDLDialect) -> None:
+    """PG 的 CREATE TABLE 列定义中不应包含 COMMENT（PG 不支持内联注释）。"""
+    sql = dialect.build_create_table(CommentModel)
+    assert "COMMENT" not in sql
+
+
+def test_build_post_alter_comment_new_column(dialect: DDLDialect) -> None:
+    """新增带注释的列时，build_post_alter 应生成 COMMENT ON COLUMN。"""
+    sqls = dialect.build_post_alter(CommentModel, modified=[], add_fields=["name", "email"])
+
+    assert any("COMMENT ON COLUMN" in s for s in sqls)
+    assert any("User display name" in s for s in sqls)
+    assert any("Email address" in s for s in sqls)
+
+
+def test_build_post_alter_comment_changed(dialect: DDLDialect) -> None:
+    """注释变化时应生成 COMMENT ON COLUMN。"""
+    existing_name = IntrospectedColumn(
+        "name", "varchar(100)", is_nullable=True, column_comment="Old comment"
+    )
+    sqls = dialect.build_post_alter(CommentModel, modified=[("name", existing_name)])
+
+    assert any("COMMENT ON COLUMN" in s for s in sqls)
+    assert any("User display name" in s for s in sqls)
+
+
+def test_build_post_alter_comment_unchanged(dialect: DDLDialect) -> None:
+    """注释未变化时不生成任何 DDL。"""
+    existing_name = IntrospectedColumn(
+        "name", "varchar(100)", is_nullable=True, column_comment="User display name"
+    )
+    sqls = dialect.build_post_alter(CommentModel, modified=[("name", existing_name)])
+
+    assert sqls == []
+
+
+def test_build_post_alter_comment_removed(dialect: DDLDialect) -> None:
+    """模型中无注释但 DB 中有 → 生成 IS NULL 删除注释。"""
+    existing_bio = IntrospectedColumn("bio", "text", is_nullable=True, column_comment="Old bio")
+    sqls = dialect.build_post_alter(CommentModel, modified=[("bio", existing_bio)])
+
+    assert any("COMMENT ON COLUMN" in s and "IS NULL" in s for s in sqls)
+    assert any("bio" in s for s in sqls)
+
+
+# ---------------------------------------------------------------------------
+# sync_table 端到端注释测试（PG 风格）
+# ---------------------------------------------------------------------------
+
+
+async def test_sync_table_creates_with_comments() -> None:
+    """新建表时：CREATE TABLE + COMMENT ON COLUMN（通过 build_post_create）。"""
+    dialect = RecordingDDLDialect(introspect_result={})
+    session = Session(dialect)
+
+    await CommentModel.sync_table(session.dialect)
+
+    # CREATE TABLE + 2 COMMENT ON COLUMN
+    assert len(dialect.executed_sqls) == 3
+    assert "CREATE TABLE IF NOT EXISTS" in dialect.executed_sqls[0]
+    assert "COMMENT ON COLUMN" in dialect.executed_sqls[1]
+    assert "COMMENT ON COLUMN" in dialect.executed_sqls[2]
+
+
+async def test_sync_table_add_column_with_comment() -> None:
+    """新增带注释列时：ALTER TABLE ADD COLUMN + COMMENT ON COLUMN。"""
+    existing = {
+        "id": IntrospectedColumn("id", "serial", is_nullable=False),
+    }
+    dialect = RecordingDDLDialect(introspect_result=existing)
+    session = Session(dialect)
+
+    await CommentModel.sync_table(session.dialect)
+
+    alter_sqls = [s for s in dialect.executed_sqls if "ALTER TABLE" in s]
+    comment_sqls = [s for s in dialect.executed_sqls if "COMMENT ON COLUMN" in s]
+    assert len(alter_sqls) == 1
+    assert len(comment_sqls) == 2  # name + email
+    assert any("User display name" in s for s in comment_sqls)
+
+
+async def test_sync_table_comment_changed() -> None:
+    """注释变更时 sync_table 应生成 COMMENT ON COLUMN。"""
+    existing = {
+        "id": IntrospectedColumn("id", "serial", is_nullable=False),
+        "name": IntrospectedColumn(
+            "name", "varchar(100)", is_nullable=True, column_comment="Old name"
+        ),
+        "email": IntrospectedColumn("email", "text", is_nullable=True, column_default=None),
+        "bio": IntrospectedColumn("bio", "text", is_nullable=True),
+    }
+    dialect = RecordingDDLDialect(introspect_result=existing)
+    session = Session(dialect)
+
+    await CommentModel.sync_table(session.dialect)
+
+    comment_sqls = [s for s in dialect.executed_sqls if "COMMENT ON COLUMN" in s]
+    # name: old → new, email: None → "Email address"
+    assert len(comment_sqls) == 2
+    assert any("User display name" in s for s in comment_sqls)
+    assert any("Email address" in s for s in comment_sqls)
+
+
+async def test_sync_table_noop_when_comments_match() -> None:
+    """列和注释都匹配时 sync_table 不应执行任何 SQL。"""
+    existing = {
+        "id": IntrospectedColumn("id", "serial", is_nullable=False),
+        "name": IntrospectedColumn(
+            "name", "varchar(100)", is_nullable=True, column_comment="User display name"
+        ),
+        "email": IntrospectedColumn(
+            "email", "text", is_nullable=True, column_comment="Email address"
+        ),
+        "bio": IntrospectedColumn("bio", "text", is_nullable=True),
+    }
+    dialect = RecordingDDLDialect(introspect_result=existing)
+    session = Session(dialect)
+
+    await CommentModel.sync_table(session.dialect)
+
+    assert len(dialect.executed_sqls) == 0
+
+
+# ---------------------------------------------------------------------------
+# MySQL 风格内联 COMMENT 测试
+# ---------------------------------------------------------------------------
+
+
+class MySQLTestDialect(AbstractDialect):
+    """最小 MySQL 风格测试方言，验证内联 COMMENT 语法。"""
+
+    quote_char = "`"
+
+    def render_placeholder(self, index: int) -> str:
+        return "%s"
+
+    def render_json_extract(self, column_sql: str, path: str, as_text: bool) -> str:
+        return f"{column_sql}->'{path}'"
+
+    def map_python_type(self, annotation: Any, column_info: ColumnInfo) -> str:
+        from vorm.ddl import resolve_base_type
+
+        base = resolve_base_type(annotation)
+        if base is int:
+            return "INT"
+        elif base is str:
+            if column_info.max_length is not None:
+                return f"VARCHAR({column_info.max_length})"
+            return "TEXT"
+        return "TEXT"
+
+    def _build_column_def(
+        self,
+        model: type[Model],
+        field_name: str,
+        column: Any,
+        info: ColumnInfo,
+    ) -> str:
+        """MySQL 风格：内联 COMMENT。"""
+        base_def = super()._build_column_def(model, field_name, column, info)
+        if info.comment:
+            escaped = info.comment.replace("'", "''")
+            base_def += f" COMMENT '{escaped}'"
+        return base_def
+
+    # -- 以下纯虚方法用 no-op 填充 --
+
+    async def begin(self) -> None:
+        pass
+
+    async def commit(self) -> None:
+        pass
+
+    async def rollback(self) -> None:
+        pass
+
+    async def execute(self, sql: str, params: list[Any]) -> Any:
+        return None
+
+    async def execute_insert(self, sql: str, params: list[Any]) -> Any:
+        return None
+
+    async def fetch(self, sql: str, params: list[Any]) -> list[dict[str, Any]]:
+        return []
+
+    async def fetchrow(self, sql: str, params: list[Any]) -> dict[str, Any] | None:
+        return None
+
+    async def close(self) -> None:
+        pass
+
+    async def introspect_columns(self, table_name: str) -> dict[str, IntrospectedColumn]:
+        return {}
+
+    async def introspect_indexes(self, table_name: str) -> set[str]:
+        return set()
+
+
+@pytest.fixture
+def mysql_dialect() -> MySQLTestDialect:
+    return MySQLTestDialect()
+
+
+def test_mysql_build_column_def_with_comment(mysql_dialect: MySQLTestDialect) -> None:
+    """MySQL _build_column_def 应在列定义末尾追加 COMMENT。"""
+    col_def = mysql_dialect._build_column_def(
+        CommentModel,
+        "name",
+        CommentModel.__columns__["name"],
+        CommentModel.__column_info__["name"],
+    )
+
+    assert "`name`" in col_def
+    assert "VARCHAR(100)" in col_def
+    assert "COMMENT 'User display name'" in col_def
+
+
+def test_mysql_build_column_def_without_comment(mysql_dialect: MySQLTestDialect) -> None:
+    """无注释时 _build_column_def 不应包含 COMMENT。"""
+    col_def = mysql_dialect._build_column_def(
+        CommentModel,
+        "bio",
+        CommentModel.__columns__["bio"],
+        CommentModel.__column_info__["bio"],
+    )
+
+    assert "COMMENT" not in col_def
+
+
+def test_mysql_build_create_table_with_comment(mysql_dialect: MySQLTestDialect) -> None:
+    """MySQL CREATE TABLE 中应内联 COMMENT。"""
+    sql = mysql_dialect.build_create_table(CommentModel)
+
+    assert "CREATE TABLE IF NOT EXISTS" in sql
+    assert "COMMENT 'User display name'" in sql
+    assert "COMMENT 'Email address'" in sql
+
+
+def test_mysql_comment_escapes_single_quote(mysql_dialect: MySQLTestDialect) -> None:
+    """注释中的单引号应被转义。"""
+
+    class QuoteModel(Model):
+        class Meta:
+            table = "quote_test"
+
+        id: int = Field(primary_key=True, auto_increment=True)
+        name: str = Field(comment="User's data")
+
+    col_def = mysql_dialect._build_column_def(
+        QuoteModel,
+        "name",
+        QuoteModel.__columns__["name"],
+        QuoteModel.__column_info__["name"],
+    )
+
+    assert "COMMENT 'User''s data'" in col_def

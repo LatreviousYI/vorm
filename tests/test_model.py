@@ -65,3 +65,20 @@ def test_column_only_fields_not_in_class_namespace() -> None:
     assert "name" not in User.__dict__
     assert "id" in User.__columns__
     assert User.__columns__["name"].field_name == "name"
+
+
+def test_field_comment_metadata() -> None:
+    """Field(comment=...) 应正确存储在 ColumnInfo 中。"""
+
+    class CommentUser(Model):
+        class Meta:
+            table = "comment_users"
+
+        id: int = Field(primary_key=True, auto_increment=True)
+        name: str = Field(max_length=50, comment="User's full name")
+        email: str  # no comment
+
+    info = CommentUser.__column_info__
+    assert info["name"].comment == "User's full name"
+    assert info["email"].comment is None
+    assert info["id"].comment is None

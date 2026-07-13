@@ -107,6 +107,7 @@ class Model(BaseModel, metaclass=ModelMeta):
 
     __table__: ClassVar[str]
     __columns__: ClassVar[dict[str, Column]]
+    # 保存了数据库字段需要的属性数据
     __column_info__: ClassVar[dict[str, ColumnInfo]]
     __pk__: ClassVar[str | None]
     __indexes__: ClassVar[list[Index]]
@@ -144,6 +145,10 @@ class Model(BaseModel, metaclass=ModelMeta):
             sql = dialect.build_create_table(cls)
             logger.info("同步表 %s：创建表", cls.__table__)
             await dialect.execute(sql, [])
+            # 建表后额外 DDL（如 PG 的 COMMENT ON COLUMN）
+            for extra_sql in dialect.build_post_create(cls):
+                logger.info("同步表 %s：执行建表后 DDL", cls.__table__)
+                await dialect.execute(extra_sql, [])
         else:
             # 收集新增列和待修改列
             missing: list[str] = []
@@ -168,7 +173,7 @@ class Model(BaseModel, metaclass=ModelMeta):
                 if sql:
                     await dialect.execute(sql, [])
                 # 额外 DDL（如 PG 创建序列）
-                for extra_sql in dialect.build_post_alter(cls, modified):
+                for extra_sql in dialect.build_post_alter(cls, modified, add_fields=missing):
                     logger.info("同步表 %s：执行额外 DDL", cls.__table__)
                     await dialect.execute(extra_sql, [])
 

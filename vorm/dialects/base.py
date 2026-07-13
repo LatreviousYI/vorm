@@ -106,6 +106,31 @@ class AbstractDialect(ABC):
         """回滚事务。"""
         raise NotImplementedError
 
+    # ------------------------------------------------------------------
+    # 执行
+    # ------------------------------------------------------------------
+
+    @abstractmethod
+    async def execute(self, sql: str, params: list[Any]) -> Any:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def execute_insert(self, sql: str, params: list[Any]) -> Any:
+        """Execute an INSERT and return the generated primary key value."""
+        raise NotImplementedError
+
+    @abstractmethod
+    async def fetch(self, sql: str, params: list[Any]) -> list[dict[str, Any]]:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def fetchrow(self, sql: str, params: list[Any]) -> dict[str, Any] | None:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def close(self) -> None:
+        raise NotImplementedError
+
     async def ping(self) -> bool:
         """健康检查：执行 ``SELECT 1`` 验证连接可用。"""
         try:
@@ -355,9 +380,12 @@ class AbstractDialect(ABC):
             parts.append("UNIQUE")
 
         # Pydantic-level default → DDL DEFAULT clause
-        default_clause = self._render_default_clause(model.model_fields[field_name], sql_type)
-        if default_clause:
-            parts.append(default_clause)
+        # auto-increment 列由数据库生成值，跳过 DEFAULT 子句（MySQL 会拒绝
+        # ``NOT NULL DEFAULT NULL``，PG 的 SERIAL 也不需要）
+        if not info.auto_increment:
+            default_clause = self._render_default_clause(model.model_fields[field_name], sql_type)
+            if default_clause:
+                parts.append(default_clause)
 
         return " ".join(parts)
 
@@ -428,6 +456,10 @@ class AbstractDialect(ABC):
         existing: IntrospectedColumn,
     ) -> bool:
         """Check if the DEFAULT value has changed between model and DB."""
+        # auto_increment 列的值由数据库生成，DEFAULT 无意义，无需比较
+        if model.__column_info__[field_name].auto_increment:
+            return False
+
         field_info = model.model_fields[field_name]
         info = model.__column_info__[field_name]
         annotation = field_info.annotation
@@ -459,6 +491,18 @@ class AbstractDialect(ABC):
 
         return _strip_quotes(expected_value).upper() != _strip_quotes(db_value).upper()
 
+    def _comment_changed(
+        self,
+        model: type[Model],
+        field_name: str,
+        existing: IntrospectedColumn,
+    ) -> bool:
+        """Check if the column comment has changed between model and DB."""
+        info = model.__column_info__[field_name]
+        expected = (info.comment or "").strip()
+        db_comment = (existing.column_comment or "").strip()
+        return expected != db_comment
+
     def build_create_table(self, model: type[Model]) -> str:
         """生成 ``CREATE TABLE IF NOT EXISTS ...`` 语句。"""
         table = self.quote_identifier(model.__table__)
@@ -469,6 +513,14 @@ class AbstractDialect(ABC):
             definitions.append(f"  {self._build_column_def(model, field_name, column, info)}")
         columns_sql = ",\n".join(definitions)
         return f"CREATE TABLE IF NOT EXISTS {table} (\n{columns_sql}\n)"
+
+    def build_post_create(self, model: type[Model]) -> list[str]:
+        """Return extra DDL to execute after CREATE TABLE (e.g. COMMENT ON COLUMN for PG).
+
+        The base returns an empty list. PostgreSQL overrides this to generate
+        ``COMMENT ON COLUMN`` statements.
+        """
+        return []
 
     def build_add_column(self, model: type[Model], field_name: str) -> str:
         """生成 ``ALTER TABLE ... ADD COLUMN ...`` 语句（单列）。"""
@@ -629,6 +681,7 @@ class AbstractDialect(ABC):
         self,
         model: type[Model],
         modified: list[tuple[str, IntrospectedColumn]],
+        add_fields: list[str] | None = None,
     ) -> list[str]:
         """返回 ALTER TABLE 之后需要执行的额外 DDL 语句。
 
@@ -660,31 +713,6 @@ class AbstractDialect(ABC):
             unique = "UNIQUE " if idx.unique else ""
             result.append(f"CREATE {unique}INDEX {self.quote_identifier(name)} ON {table} ({cols})")
         return result
-
-    # ------------------------------------------------------------------
-    # 执行
-    # ------------------------------------------------------------------
-
-    @abstractmethod
-    async def execute(self, sql: str, params: list[Any]) -> Any:
-        raise NotImplementedError
-
-    @abstractmethod
-    async def execute_insert(self, sql: str, params: list[Any]) -> Any:
-        """Execute an INSERT and return the generated primary key value."""
-        raise NotImplementedError
-
-    @abstractmethod
-    async def fetch(self, sql: str, params: list[Any]) -> list[dict[str, Any]]:
-        raise NotImplementedError
-
-    @abstractmethod
-    async def fetchrow(self, sql: str, params: list[Any]) -> dict[str, Any] | None:
-        raise NotImplementedError
-
-    @abstractmethod
-    async def close(self) -> None:
-        raise NotImplementedError
 
     # ------------------------------------------------------------------
     # 内部帮助方法

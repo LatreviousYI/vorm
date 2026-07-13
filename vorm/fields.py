@@ -19,6 +19,7 @@ class ColumnInfo:
         "max_length",
         "db_type",
         "timestamp_behavior",
+        "comment",
     )
 
     def __init__(
@@ -33,6 +34,7 @@ class ColumnInfo:
         max_length: int | None = None,
         db_type: str | None = None,
         timestamp_behavior: str | None = None,
+        comment: str | None = None,
     ) -> None:
         self.primary_key = primary_key
         self.auto_increment = auto_increment
@@ -43,6 +45,7 @@ class ColumnInfo:
         self.max_length = max_length
         self.db_type = db_type
         self.timestamp_behavior = timestamp_behavior
+        self.comment = comment
 
 
 def Field(
@@ -57,6 +60,7 @@ def Field(
     max_length: int | None = None,
     db_type: str | None = None,
     timestamp_behavior: str | None = None,
+    comment: str | None = None,
     **pydantic_kwargs: Any,
 ) -> Any:
     """Drop-in replacement for pydantic.Field that carries ORM column metadata."""
@@ -73,6 +77,7 @@ def Field(
         max_length=max_length,
         db_type=db_type,
         timestamp_behavior=timestamp_behavior,
+        comment=comment,
     )
     json_schema_extra = pydantic_kwargs.pop("json_schema_extra", None)
     if json_schema_extra is None:
