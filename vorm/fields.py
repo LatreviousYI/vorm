@@ -79,6 +79,11 @@ def Field(
         timestamp_behavior=timestamp_behavior,
         comment=comment,
     )
+    # max_length 同时是 ORM 参数（VARCHAR(N)）和 Pydantic 参数（字符串校验），
+    # 需要传给两边，否则 Pydantic 收不到长度校验
+    if max_length is not None:
+        pydantic_kwargs.setdefault("max_length", max_length)
+
     json_schema_extra = pydantic_kwargs.pop("json_schema_extra", None)
     if json_schema_extra is None:
         json_schema_extra = {}
