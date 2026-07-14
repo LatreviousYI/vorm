@@ -38,3 +38,10 @@ ignore_missing_imports = true
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org"
+publish-url = "https://upload.pypi.org/legacy/"
+explicit = true
