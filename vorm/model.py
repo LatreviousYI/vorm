@@ -36,7 +36,6 @@ class ModelMeta(ModelMetaclass):
         columns: dict[str, Column] = {}
         column_info: dict[str, ColumnInfo] = {}
         pk_name: str | None = None
-
         for field_name, field_info in cls.model_fields.items():
             info = get_column_info(field_info) or ColumnInfo()
             column_name = info.column_name or field_name
@@ -143,6 +142,7 @@ class Model(BaseModel, metaclass=ModelMeta):
 
         if not existing:
             sql = dialect.build_create_table(cls)
+            print(sql)
             logger.info("同步表 %s：创建表", cls.__table__)
             await dialect.execute(sql, [])
             # 建表后额外 DDL（如 PG 的 COMMENT ON COLUMN）

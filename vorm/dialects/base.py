@@ -580,7 +580,9 @@ class AbstractDialect(ABC):
             col_name = self.quote_identifier(column.column_name)
 
             old_normalized = self._normalize_type(existing.data_type)
-            new_normalized = new_type.lower()
+            # SERIAL/BIGSERIAL 在 PG 内部是 INTEGER/BIGINT + nextval()，
+            # 比对时也转为底层类型，否则每次 sync 都误判为 type_change
+            new_normalized = self._alter_column_type(new_type).lower()
 
             type_changed = old_normalized != new_normalized
             null_changed = info.nullable != existing.is_nullable
@@ -645,7 +647,9 @@ class AbstractDialect(ABC):
             col_name = self.quote_identifier(column.column_name)
 
             old_normalized = self._normalize_type(existing.data_type)
-            new_normalized = new_type.lower()
+            # SERIAL/BIGSERIAL 在 PG 内部是 INTEGER/BIGINT + nextval()，
+            # 比对时也转为底层类型，否则每次 sync 都误判为 type_change
+            new_normalized = self._alter_column_type(new_type).lower()
 
             type_changed = old_normalized != new_normalized
             null_changed = info.nullable != existing.is_nullable

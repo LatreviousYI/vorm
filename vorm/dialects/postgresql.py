@@ -161,16 +161,27 @@ class PostgreSQLDialect(AbstractDialect):
     # -- DDL ---------------------------------------------------------------
 
     def _normalize_type(self, db_type: str) -> str:
-        """PG: 归一化类型名，处理别名。
+        """PG: 归一化类型名，与 ``map_python_type`` 的输出对齐。
 
-        ``integer`` → ``int``, ``character varying`` → ``varchar`` 等。
-        保留类型参数（如 ``varchar(100)``, ``numeric(10,2)``），用于长度/精度变更检测。
+        PG 内省返回的类型名可能是缩写或内部名，需要和模型映射的类型统一。
+        保留参数（如 ``varchar(100)``）用于长度变更检测。
         """
+        import re
+
         t = db_type.lower().strip()
-        t = t.replace("integer", "int")
-        t = t.replace("boolean", "bool")
+        # PG 整型缩写：int2 → smallint, int4 → integer, int8 → bigint
+        t = t.replace("int8", "bigint")
+        t = t.replace("int4", "integer")
+        t = t.replace("int2", "smallint")
+        # 布尔：PG 缩写 bool → boolean（用词边界避免 boolean→booleanean）
+        t = re.sub(r"\bbool\b", "boolean", t)
+        # 浮点：PG float8 = double precision
+        t = t.replace("float8", "double precision")
+        # 数值：PG 的 numeric 即 decimal
+        t = t.replace("numeric", "decimal")
+        # 文本
         t = t.replace("character varying", "varchar")
-        t = t.replace("double precision", "double")
+        # 日期时间
         t = t.replace("timestamp without time zone", "timestamp")
         t = t.replace("timestamp with time zone", "timestamptz")
         return t
