@@ -1,5 +1,7 @@
 # vorm
 
+[English](./README_EN.md)
+
 **Async ORM for Python 3.10+** — MySQL and PostgreSQL, 基于 Pydantic v2 开发, 以pydantic作为数据模型,同时增加额外字段属性作为数据库字段必要属性,从而可以操作数据库表结构.这个库以精简为主,不提供外键以及多对一,多对多等键功能
 
 ## 特性
