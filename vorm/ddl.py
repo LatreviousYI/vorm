@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import enum
 import typing
 from dataclasses import dataclass
 from typing import Any
@@ -55,3 +56,15 @@ def is_optional(annotation: Any) -> bool:
     if args:
         return type(None) in args
     return False
+
+
+def is_enum_type(annotation: Any) -> bool:
+    """Return ``True`` if the annotation resolves to an ``enum.Enum`` subclass."""
+    base = resolve_base_type(annotation)
+    return isinstance(base, type) and issubclass(base, enum.Enum)
+
+
+def get_enum_values(annotation: Any) -> list[Any]:
+    """Return the list of member values from an ``enum.Enum`` subclass."""
+    base = resolve_base_type(annotation)
+    return [member.value for member in base.__members__.values()]

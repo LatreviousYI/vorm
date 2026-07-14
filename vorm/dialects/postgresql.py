@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import datetime as _dt
 import decimal
+import enum
 import logging
 import re
 from typing import TYPE_CHECKING, Any
 
 import asyncpg
 
-from vorm.ddl import IntrospectedColumn, resolve_base_type
+from vorm.ddl import IntrospectedColumn, get_enum_values, is_enum_type, resolve_base_type
 from vorm.dialects.base import AbstractDialect
 from vorm.fields import ColumnInfo
 
@@ -208,6 +209,12 @@ class PostgreSQLDialect(AbstractDialect):
 
         base = resolve_base_type(annotation)
 
+        # 枚举检测：Python enum.Enum → PG 自定义枚举类型
+        # IntEnum 跳过（PG 不支持整型枚举），让其 fall 到 INTEGER
+        if isinstance(base, type) and issubclass(base, enum.Enum):
+            if not issubclass(base, int):
+                return base.__name__.lower()
+
         if base is int:
             if column_info.auto_increment and column_info.primary_key:
                 return "SERIAL"
@@ -268,6 +275,79 @@ class PostgreSQLDialect(AbstractDialect):
                 column_comment=comment_map.get(row["column_name"]),
             )
             result[col.column_name.lower()] = col
+        return result
+
+    async def introspect_enum_types(self) -> dict[str, set[str]]:
+        """Query pg_catalog to discover all existing enum types and their values."""
+        query = (
+            "SELECT t.typname AS type_name, e.enumlabel AS enum_value "
+            "FROM pg_catalog.pg_type t "
+            "JOIN pg_catalog.pg_enum e ON t.oid = e.enumtypid "
+            "ORDER BY t.typname, e.enumsortorder"
+        )
+        rows = await self.fetch(query, [])
+        result: dict[str, set[str]] = {}
+        for row in rows:
+            result.setdefault(row["type_name"], set()).add(row["enum_value"])
+        return result
+
+    def build_pre_create(
+        self,
+        model: type[Model],
+        existing_enums: dict[str, set[str]] | None = None,
+    ) -> list[str]:
+        """Generate CREATE TYPE ... AS ENUM for each unique enum type used by the model.
+
+        Skips types that already exist in the database.
+        """
+        result: list[str] = []
+        existing = existing_enums or {}
+        seen: set[str] = set()
+
+        for field_name, info in model.__column_info__.items():
+            annotation = model.model_fields[field_name].annotation
+            if not is_enum_type(annotation):
+                continue
+            base = resolve_base_type(annotation)
+            type_name = base.__name__.lower()
+            if type_name in seen or type_name in existing:
+                continue
+            seen.add(type_name)
+            values = get_enum_values(annotation)
+            escaped_vals = ", ".join(f"'{v}'" for v in values)
+            quoted = self.quote_identifier(type_name)
+            result.append(f"CREATE TYPE {quoted} AS ENUM ({escaped_vals})")
+
+        return result
+
+    def build_pre_alter(
+        self,
+        model: type[Model],
+        existing_enums: dict[str, set[str]] | None = None,
+    ) -> list[str]:
+        """Generate ALTER TYPE ... ADD VALUE for new enum members, or CREATE TYPE
+        for enum types that don't exist yet.
+        """
+        result: list[str] = []
+        existing = existing_enums or {}
+
+        for field_name, info in model.__column_info__.items():
+            annotation = model.model_fields[field_name].annotation
+            if not is_enum_type(annotation):
+                continue
+            base = resolve_base_type(annotation)
+            type_name = base.__name__.lower()
+            quoted = self.quote_identifier(type_name)
+            current_values = set(str(v) for v in get_enum_values(annotation))
+
+            if type_name not in existing:
+                escaped_vals = ", ".join(f"'{v}'" for v in sorted(current_values))
+                result.append(f"CREATE TYPE {quoted} AS ENUM ({escaped_vals})")
+            else:
+                db_values = existing[type_name]
+                for val in sorted(current_values - db_values):
+                    result.append(f"ALTER TYPE {quoted} ADD VALUE '{val}'")
+
         return result
 
     def build_post_create(self, model: type[Model]) -> list[str]:

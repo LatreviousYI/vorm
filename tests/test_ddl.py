@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime
+import enum
 from typing import Any
 
 import pytest
@@ -62,6 +63,13 @@ class DDLDialect(AbstractDialect):
         from vorm.ddl import resolve_base_type
 
         base = resolve_base_type(annotation)
+
+        # 枚举检测：Python enum.Enum → PG 自定义枚举类型
+        # IntEnum 跳过（PG 不支持整型枚举），让其 fall 到 INTEGER
+        if isinstance(base, type) and issubclass(base, enum.Enum):
+            if not issubclass(base, int):
+                return base.__name__.lower()
+
         if base is int:
             if column_info.auto_increment:
                 return "SERIAL"
@@ -134,6 +142,70 @@ class DDLDialect(AbstractDialect):
     async def introspect_columns(self, table_name: str) -> dict[str, IntrospectedColumn]:
         return {}
 
+    # -- PG 风格枚举支持 ------------------------------------------------
+
+    async def introspect_enum_types(self) -> dict[str, set[str]]:
+        """DDLDialect 默认返回空，子类可覆写。"""
+        return {}
+
+    def build_pre_create(
+        self,
+        model: type[Model],
+        existing_enums: dict[str, set[str]] | None = None,
+    ) -> list[str]:
+        """PG 风格：生成 CREATE TYPE ... AS ENUM (...)。"""
+        from vorm.ddl import get_enum_values, is_enum_type, resolve_base_type
+
+        result: list[str] = []
+        existing = existing_enums or {}
+        seen: set[str] = set()
+
+        for field_name, info in model.__column_info__.items():
+            annotation = model.model_fields[field_name].annotation
+            if not is_enum_type(annotation):
+                continue
+            base = resolve_base_type(annotation)
+            type_name = base.__name__.lower()
+            if type_name in seen or type_name in existing:
+                continue
+            seen.add(type_name)
+            values = get_enum_values(annotation)
+            escaped_vals = ", ".join(f"'{v}'" for v in values)
+            quoted = self.quote_identifier(type_name)
+            result.append(f"CREATE TYPE {quoted} AS ENUM ({escaped_vals})")
+
+        return result
+
+    def build_pre_alter(
+        self,
+        model: type[Model],
+        existing_enums: dict[str, set[str]] | None = None,
+    ) -> list[str]:
+        """PG 风格：生成 ALTER TYPE ... ADD VALUE ... 或 CREATE TYPE（新枚举）。"""
+        from vorm.ddl import get_enum_values, is_enum_type, resolve_base_type
+
+        result: list[str] = []
+        existing = existing_enums or {}
+
+        for field_name, info in model.__column_info__.items():
+            annotation = model.model_fields[field_name].annotation
+            if not is_enum_type(annotation):
+                continue
+            base = resolve_base_type(annotation)
+            type_name = base.__name__.lower()
+            quoted = self.quote_identifier(type_name)
+            current_values = set(str(v) for v in get_enum_values(annotation))
+
+            if type_name not in existing:
+                escaped_vals = ", ".join(f"'{v}'" for v in sorted(current_values))
+                result.append(f"CREATE TYPE {quoted} AS ENUM ({escaped_vals})")
+            else:
+                db_values = existing[type_name]
+                for val in sorted(current_values - db_values):
+                    result.append(f"ALTER TYPE {quoted} ADD VALUE '{val}'")
+
+        return result
+
 
 class RecordingDDLDialect(DDLDialect):
     """记录所有执行的 SQL，并可预设内省结果。"""
@@ -142,9 +214,11 @@ class RecordingDDLDialect(DDLDialect):
         self,
         introspect_result: dict[str, IntrospectedColumn] | None = None,
         introspect_indexes: set[str] | None = None,
+        introspect_enums: dict[str, set[str]] | None = None,
     ) -> None:
         self._introspect_result = introspect_result or {}
         self._introspect_indexes = introspect_indexes or set()
+        self._introspect_enums = introspect_enums or {}
         self.executed_sqls: list[str] = []
         self.last_sql: str = ""
         self.last_params: list[Any] = []
@@ -154,6 +228,9 @@ class RecordingDDLDialect(DDLDialect):
         self.last_params = params
         self.executed_sqls.append(sql)
         return None
+
+    async def introspect_enum_types(self) -> dict[str, set[str]]:
+        return self._introspect_enums
 
     async def introspect_indexes(self, table_name: str) -> set[str]:
         return self._introspect_indexes
@@ -1061,9 +1138,21 @@ class MySQLTestDialect(AbstractDialect):
         return f"{column_sql}->'{path}'"
 
     def map_python_type(self, annotation: Any, column_info: ColumnInfo) -> str:
-        from vorm.ddl import resolve_base_type
+        from vorm.ddl import get_enum_values, resolve_base_type
 
         base = resolve_base_type(annotation)
+
+        # 枚举检测：Python enum → MySQL ENUM('val1','val2',...)
+        # IntEnum 不生成 ENUM（MySQL ENUM 只支持字符串值）
+        if isinstance(base, type) and issubclass(base, enum.Enum):
+            if column_info.db_type:
+                return column_info.db_type
+            if issubclass(base, int):
+                return "INT"
+            values = get_enum_values(annotation)
+            quoted = ",".join(f"'{v}'" for v in values)
+            return f"ENUM({quoted})"
+
         if base is int:
             return "INT"
         elif base is str:
@@ -1071,6 +1160,62 @@ class MySQLTestDialect(AbstractDialect):
                 return f"VARCHAR({column_info.max_length})"
             return "TEXT"
         return "TEXT"
+
+    def build_modify_columns(
+        self,
+        model: type[Model],
+        field_pairs: list[tuple[str, IntrospectedColumn]],
+    ) -> str:
+        """MySQL 风格：MODIFY COLUMN 语法。"""
+        table = self.quote_identifier(model.__table__)
+        col_defs: list[str] = []
+        model_columns = model.__columns__
+        model_column_info = model.__column_info__
+
+        for field_name, existing in field_pairs:
+            column = model_columns[field_name]
+            info = model_column_info[field_name]
+            annotation = model.model_fields[field_name].annotation
+            new_type = self.map_python_type(annotation, info)
+
+            old_normalized = self._normalize_type(existing.data_type)
+            new_normalized = new_type.lower()
+
+            type_changed = old_normalized != new_normalized
+            null_changed = info.nullable != existing.is_nullable
+            default_changed = self._default_changed(model, field_name, existing)
+            comment_changed = self._comment_changed(model, field_name, existing)
+
+            if (
+                not type_changed
+                and not null_changed
+                and not default_changed
+                and not comment_changed
+            ):
+                continue
+
+            col_name = self.quote_identifier(column.column_name)
+            parts = [col_name, new_type]
+            if not info.nullable:
+                parts.append("NOT NULL")
+            else:
+                parts.append("NULL")
+            if not info.auto_increment:
+                default_clause = self._render_default_clause(
+                    model.model_fields[field_name], new_type
+                )
+                if default_clause:
+                    parts.append(default_clause)
+            if info.comment:
+                escaped = info.comment.replace("'", "''")
+                parts.append(f"COMMENT '{escaped}'")
+            col_defs.append(f"MODIFY COLUMN {' '.join(parts)}")
+
+        if not col_defs:
+            return ""
+
+        sep = ",\n  "
+        return f"ALTER TABLE {table}\n  {sep.join(col_defs)}"
 
     def _build_column_def(
         self,
@@ -1177,3 +1322,467 @@ def test_mysql_comment_escapes_single_quote(mysql_dialect: MySQLTestDialect) -> 
     )
 
     assert "COMMENT 'User''s data'" in col_def
+
+
+# ---------------------------------------------------------------------------
+# 枚举辅助函数测试
+# ---------------------------------------------------------------------------
+
+
+class _TestStrEnum(str, enum.Enum):
+    DRAFT = "draft"
+    PUBLISHED = "published"
+    ARCHIVED = "archived"
+
+
+class _TestIntEnum(int, enum.Enum):
+    LOW = 1
+    MEDIUM = 2
+    HIGH = 3
+
+
+class _TestPlainEnum(enum.Enum):
+    FOO = "foo"
+    BAR = "bar"
+
+
+def test_is_enum_type_with_str_enum():
+    from vorm.ddl import is_enum_type
+
+    assert is_enum_type(_TestStrEnum) is True
+
+
+def test_is_enum_type_with_int_enum():
+    from vorm.ddl import is_enum_type
+
+    assert is_enum_type(_TestIntEnum) is True
+
+
+def test_is_enum_type_with_plain_enum():
+    from vorm.ddl import is_enum_type
+
+    assert is_enum_type(_TestPlainEnum) is True
+
+
+def test_is_enum_type_with_optional_enum():
+    from vorm.ddl import is_enum_type
+
+    assert is_enum_type(_TestStrEnum | None) is True
+    assert is_enum_type(None | _TestStrEnum) is True
+
+
+def test_is_enum_type_with_plain_str():
+    from vorm.ddl import is_enum_type
+
+    assert is_enum_type(str) is False
+
+
+def test_is_enum_type_with_int():
+    from vorm.ddl import is_enum_type
+
+    assert is_enum_type(int) is False
+
+
+def test_get_enum_values_str_enum():
+    from vorm.ddl import get_enum_values
+
+    assert get_enum_values(_TestStrEnum) == ["draft", "published", "archived"]
+
+
+def test_get_enum_values_int_enum():
+    from vorm.ddl import get_enum_values
+
+    assert get_enum_values(_TestIntEnum) == [1, 2, 3]
+
+
+def test_get_enum_values_plain_enum():
+    from vorm.ddl import get_enum_values
+
+    assert get_enum_values(_TestPlainEnum) == ["foo", "bar"]
+
+
+def test_get_enum_values_with_optional():
+    from vorm.ddl import get_enum_values
+
+    assert get_enum_values(_TestStrEnum | None) == ["draft", "published", "archived"]
+
+
+# ---------------------------------------------------------------------------
+# _render_default_clause 枚举默认值测试
+# ---------------------------------------------------------------------------
+
+
+class _DefaultStrEnumModel(Model):
+    class Meta:
+        table = "default_str_enum"
+
+    id: int = Field(primary_key=True, auto_increment=True)
+    status: _TestStrEnum = _TestStrEnum.PUBLISHED
+
+
+class _DefaultPlainEnumModel(Model):
+    class Meta:
+        table = "default_plain_enum"
+
+    id: int = Field(primary_key=True, auto_increment=True)
+    flag: _TestPlainEnum = _TestPlainEnum.BAR
+
+
+class _DefaultIntEnumModel(Model):
+    class Meta:
+        table = "default_int_enum"
+
+    id: int = Field(primary_key=True, auto_increment=True)
+    level: _TestIntEnum = _TestIntEnum.MEDIUM
+
+
+def test_render_default_clause_str_enum():
+    """StrEnum 默认值渲染为 DEFAULT 'value'。"""
+    dialect = DDLDialect()
+    field_info = _DefaultStrEnumModel.model_fields["status"]
+    result = dialect._render_default_clause(field_info, "statusenum")
+    assert result == "DEFAULT 'published'"
+
+
+def test_render_default_clause_plain_enum():
+    """非 StrEnum/IntEnum 的普通 Enum 也能正确渲染 DEFAULT。"""
+    dialect = DDLDialect()
+    field_info = _DefaultPlainEnumModel.model_fields["flag"]
+    result = dialect._render_default_clause(field_info, "testenum")
+    assert result == "DEFAULT 'bar'"
+
+
+def test_render_default_clause_int_enum():
+    """IntEnum 默认值渲染为 DEFAULT <number>。"""
+    dialect = DDLDialect()
+    field_info = _DefaultIntEnumModel.model_fields["level"]
+    result = dialect._render_default_clause(field_info, "INTEGER")
+    assert result == "DEFAULT 2"
+
+
+# ---------------------------------------------------------------------------
+# build_pre_create / introspect_enum_types — 基类默认行为
+# ---------------------------------------------------------------------------
+
+
+def test_build_pre_create_default_returns_empty():
+    """build_pre_create 对无枚举模型返回空列表。"""
+
+    class _NoEnumModel(Model):
+        class Meta:
+            table = "no_enum_test"
+
+        id: int = Field(primary_key=True, auto_increment=True)
+        name: str = Field(max_length=100)
+
+    dialect = DDLDialect()
+    result = dialect.build_pre_create(_NoEnumModel)
+    assert result == []
+
+
+async def test_introspect_enum_types_default_returns_empty():
+    """基类 introspect_enum_types 默认返回空 dict。"""
+    dialect = DDLDialect()
+    result = await dialect.introspect_enum_types()
+    assert result == {}
+
+
+# ---------------------------------------------------------------------------
+# PG 风格枚举 DDL 测试
+# ---------------------------------------------------------------------------
+
+
+class _PGEnumModel(Model):
+    class Meta:
+        table = "pg_enum_test"
+
+    id: int = Field(primary_key=True, auto_increment=True)
+    status: _TestStrEnum
+
+
+class _PGMultiEnumModel(Model):
+    class Meta:
+        table = "pg_multi_enum"
+
+    id: int = Field(primary_key=True, auto_increment=True)
+    status: _TestStrEnum
+    secondary: _TestStrEnum  # 同一个枚举类型用两次
+
+
+class _PGDoubleEnumModel(Model):
+    class Meta:
+        table = "pg_double_enum"
+
+    id: int = Field(primary_key=True, auto_increment=True)
+    status: _TestStrEnum
+    color: _TestPlainEnum  # 不同的枚举类型
+
+
+def test_pg_map_enum_type_returns_lowercase_name():
+    """PG map_python_type 对 enum 返回类名小写。"""
+    dialect = DDLDialect()
+    annotation = _PGEnumModel.model_fields["status"].annotation
+    result = dialect.map_python_type(annotation, _PGEnumModel.__column_info__["status"])
+    assert result == "_teststrenum"
+
+
+def test_pg_map_enum_type_optional():
+    """Optional[Enum] 也能正确映射。"""
+
+    class _OptEnumModel(Model):
+        class Meta:
+            table = "opt"
+
+        id: int = Field(primary_key=True, auto_increment=True)
+        status: _TestStrEnum | None = None
+
+    dialect = DDLDialect()
+    annotation = _OptEnumModel.model_fields["status"].annotation
+    result = dialect.map_python_type(annotation, _OptEnumModel.__column_info__["status"])
+    assert result == "_teststrenum"
+
+
+def test_pg_build_pre_create_single_enum():
+    """生成 CREATE TYPE 语句。"""
+    dialect = DDLDialect()
+    result = dialect.build_pre_create(_PGEnumModel)
+    assert len(result) == 1
+    assert result[0] == """CREATE TYPE "_teststrenum" AS ENUM ('draft', 'published', 'archived')"""
+
+
+def test_pg_build_pre_create_deduplicates_same_enum():
+    """同一枚举类被多个字段引用时只生成一条 CREATE TYPE。"""
+    dialect = DDLDialect()
+    result = dialect.build_pre_create(_PGMultiEnumModel)
+    assert len(result) == 1
+
+
+def test_pg_build_pre_create_skips_existing_types():
+    """已有类型跳过，不重复生成 CREATE TYPE。"""
+    dialect = DDLDialect()
+    result = dialect.build_pre_create(
+        _PGEnumModel, existing_enums={"_teststrenum": {"draft", "published", "archived"}}
+    )
+    assert result == []
+
+
+def test_pg_build_pre_create_multiple_enum_types():
+    """多个不同枚举类型各自生成 CREATE TYPE。"""
+    dialect = DDLDialect()
+    result = dialect.build_pre_create(_PGDoubleEnumModel)
+    assert len(result) == 2
+    assert any("_teststrenum" in r for r in result)
+    assert any("_testplainenum" in r for r in result)
+
+
+def test_pg_build_pre_create_no_enum_model():
+    """无枚举模型返回空列表。"""
+    dialect = DDLDialect()
+
+    class _NoEnumModel(Model):
+        class Meta:
+            table = "no_enum"
+
+        id: int = Field(primary_key=True, auto_increment=True)
+        name: str = Field(max_length=100)
+
+    result = dialect.build_pre_create(_NoEnumModel)
+    assert result == []
+
+
+def test_pg_build_pre_alter_add_new_values():
+    """已有枚举类型缺少新值 → ALTER TYPE ADD VALUE。"""
+    dialect = DDLDialect()
+    result = dialect.build_pre_alter(
+        _PGEnumModel,
+        existing_enums={"_teststrenum": {"draft"}},  # 缺少 published 和 archived
+    )
+    assert len(result) == 2
+    assert """ALTER TYPE "_teststrenum" ADD VALUE 'archived'""" in result
+    assert """ALTER TYPE "_teststrenum" ADD VALUE 'published'""" in result
+
+
+def test_pg_build_pre_alter_no_change():
+    """枚举值匹配时返回空列表。"""
+    dialect = DDLDialect()
+    result = dialect.build_pre_alter(
+        _PGEnumModel,
+        existing_enums={"_teststrenum": {"draft", "published", "archived"}},
+    )
+    assert result == []
+
+
+def test_pg_build_pre_alter_new_type():
+    """数据库中不存在该枚举类型 → 生成 CREATE TYPE。"""
+    dialect = DDLDialect()
+    result = dialect.build_pre_alter(_PGEnumModel, existing_enums={})
+    assert len(result) == 1
+    assert "CREATE TYPE" in result[0]
+
+
+def test_pg_build_create_table_uses_enum_type_name():
+    """建表语句中枚举列使用自定义类型名。"""
+    dialect = DDLDialect()
+    sql = dialect.build_create_table(_PGEnumModel)
+    assert "_teststrenum" in sql
+
+
+def test_pg_db_type_overrides_enum_auto_detect():
+    """db_type 覆盖枚举自动检测。"""
+
+    class _OverrideModel(Model):
+        class Meta:
+            table = "override"
+
+        id: int = Field(primary_key=True, auto_increment=True)
+        status: _TestStrEnum = Field(db_type="my_custom_enum")
+
+    dialect = DDLDialect()
+    annotation = _OverrideModel.model_fields["status"].annotation
+    result = dialect.map_python_type(annotation, _OverrideModel.__column_info__["status"])
+    assert result == "my_custom_enum"
+
+
+# ---------------------------------------------------------------------------
+# MySQL 风格 ENUM 测试
+# ---------------------------------------------------------------------------
+
+
+class _MySQLEnumModel(Model):
+    class Meta:
+        table = "mysql_enum_test"
+
+    id: int = Field(primary_key=True, auto_increment=True)
+    status: _TestStrEnum
+
+
+@pytest.fixture
+def mysql_dialect_enum() -> MySQLTestDialect:
+    return MySQLTestDialect()
+
+
+def test_mysql_map_enum_type_returns_enum_syntax():
+    """MySQL map_python_type 对 enum 返回 ENUM('v1','v2',...)。"""
+    dialect = MySQLTestDialect()
+    annotation = _MySQLEnumModel.model_fields["status"].annotation
+    result = dialect.map_python_type(annotation, _MySQLEnumModel.__column_info__["status"])
+    assert result == "ENUM('draft','published','archived')"
+
+
+def test_mysql_enum_db_type_override():
+    """MySQL db_type 覆盖枚举自动检测。"""
+
+    class _MySQLOverrideModel(Model):
+        class Meta:
+            table = "mysql_override"
+
+        id: int = Field(primary_key=True, auto_increment=True)
+        status: _TestStrEnum = Field(db_type="ENUM('draft','published')")
+
+    dialect = MySQLTestDialect()
+    annotation = _MySQLOverrideModel.model_fields["status"].annotation
+    result = dialect.map_python_type(annotation, _MySQLOverrideModel.__column_info__["status"])
+    assert result == "ENUM('draft','published')"
+
+
+def test_mysql_create_table_includes_inline_enum():
+    """MySQL 建表语句中枚举列包含内联 ENUM 定义。"""
+    dialect = MySQLTestDialect()
+    sql = dialect.build_create_table(_MySQLEnumModel)
+    assert "ENUM('draft','published','archived')" in sql
+
+
+def test_mysql_int_enum_maps_to_int():
+    """MySQL IntEnum 映射为 INT（不生成 ENUM，因为 int 分支先匹配）。"""
+    dialect = MySQLTestDialect()
+    annotation = _DefaultIntEnumModel.model_fields["level"].annotation
+    result = dialect.map_python_type(annotation, _DefaultIntEnumModel.__column_info__["level"])
+    assert result == "INT"
+
+
+def test_mysql_modify_columns_detects_enum_value_change():
+    """MySQL MODIFY COLUMN：枚举值变更时触发 MODIFY COLUMN。"""
+    dialect = MySQLTestDialect()
+
+    class _OldEnumModel(Model):
+        class Meta:
+            table = "old_enum"
+
+        id: int = Field(primary_key=True, auto_increment=True)
+        status: _TestStrEnum  # 完整值：draft, published, archived
+
+    # 模拟数据库中的旧值只有 2 个
+    existing = IntrospectedColumn(
+        column_name="status",
+        data_type="enum('draft','published')",
+        is_nullable=True,
+    )
+    result = dialect.build_modify_columns(_OldEnumModel, [("status", existing)])
+    # 类型从 enum('draft','published') 变为 ENUM('draft','published','archived')
+    # lower 后不匹配 → type_changed=True → MODIFY COLUMN
+    assert "MODIFY COLUMN" in result
+    assert "ENUM" in result
+
+
+def test_mysql_modify_columns_skips_when_enum_unchanged():
+    """MySQL MODIFY COLUMN：枚举值不变时跳过。"""
+    dialect = MySQLTestDialect()
+
+    class _SameEnumModel(Model):
+        class Meta:
+            table = "same_enum"
+
+        id: int = Field(primary_key=True, auto_increment=True)
+        status: _TestStrEnum
+
+    # 模拟数据库中已有完整值
+    existing = IntrospectedColumn(
+        column_name="status",
+        data_type="enum('draft','published','archived')",
+        is_nullable=True,
+    )
+    result = dialect.build_modify_columns(_SameEnumModel, [("status", existing)])
+    assert result == ""
+
+
+# ---------------------------------------------------------------------------
+# sync_table 端到端枚举测试
+# ---------------------------------------------------------------------------
+
+
+class _SyncEnumModel(Model):
+    class Meta:
+        table = "sync_enum_test"
+
+    id: int = Field(primary_key=True, auto_increment=True)
+    status: _TestStrEnum
+
+
+async def test_sync_table_creates_with_enum_type():
+    """建表时 pre_create 先于 create_table 执行。"""
+    dialect = RecordingDDLDialect(
+        introspect_result={},  # 表不存在
+    )
+    session = Session(dialect)
+
+    await _SyncEnumModel.sync_table(session.dialect)
+
+    # 验证 pre_create 在 create_table 之前执行
+    assert len(dialect.executed_sqls) == 2
+    assert "CREATE TYPE" in dialect.executed_sqls[0]
+    assert "CREATE TABLE" in dialect.executed_sqls[1]
+
+
+async def test_sync_table_skips_existing_enum_type():
+    """已有枚举类型时不重复 CREATE TYPE。"""
+    dialect = RecordingDDLDialect(
+        introspect_result={},  # 表不存在
+        introspect_enums={"_teststrenum": {"draft", "published", "archived"}},
+    )
+    session = Session(dialect)
+
+    await _SyncEnumModel.sync_table(session.dialect)
+
+    # pre_create 为空，只有 CREATE TABLE
+    assert len(dialect.executed_sqls) == 1
+    assert "CREATE TABLE" in dialect.executed_sqls[0]

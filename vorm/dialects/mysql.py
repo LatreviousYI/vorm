@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import datetime as _dt
 import decimal
+import enum
 import logging
 from typing import Any, cast
 
 import asyncmy
 
-from vorm.ddl import IntrospectedColumn, resolve_base_type
+from vorm.ddl import IntrospectedColumn, get_enum_values, resolve_base_type
 from vorm.dialects.base import AbstractDialect
 from vorm.fields import ColumnInfo
 
@@ -217,6 +218,15 @@ class MySQLDialect(AbstractDialect):
             return t
 
         base = resolve_base_type(annotation)
+
+        # 枚举检测：Python enum → MySQL ENUM('val1','val2',...)
+        # IntEnum 不生成 ENUM（MySQL ENUM 只支持字符串值）
+        if isinstance(base, type) and issubclass(base, enum.Enum):
+            if issubclass(base, int):
+                return "INT"
+            values = get_enum_values(annotation)
+            quoted = ",".join(f"'{v}'" for v in values)
+            return f"ENUM({quoted})"
 
         if base is int:
             if column_info.auto_increment:

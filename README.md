@@ -31,26 +31,35 @@ pip install vorm
 import datetime
 from vorm import Field, Model
 from vorm.ddl import Index
+from enum import Enum
 
-class AllFieldTypes(Model):
+class FruitEnum(str, Enum):
+    pear = 'pear'
+    banana = 'banana'
+    apple = 'apple'
+
+
+class BaseField(Model):
+    id_base:int|None=None
+
+class AllFieldTypes(BaseField):
     """覆盖所有 Python 类型 → SQL 类型的映射。"""
 
     class Meta:
         table = "all_field_types"
-        indexes = [
-            Index(fields=("short_text",),unique=True),
-            Index(fields=("age","score")) #联合索引
-        ]
-    # 注意: 当数据库中的某个字段值可能为None时, 请在类型后面加上 None类型, 否则反序列化时会报错 例如: short_name :str|None
+        indexes = [Index(fields=("short_text",),unique=True),
+                Index(fields=("age","score"))
+                ]
+
     # -- 主键 ---------------------------------------------------------
-    id: int = Field(primary_key=True, auto_increment=True,db_type="bigint")
-    # db_type 当设置了这个值的时候,数据库会直接使用这个值作为类型
+
+    id: int = Field(primary_key=True, auto_increment=True)
     # MySQL    → `id` INT AUTO_INCREMENT PRIMARY KEY
     # PG       → "id" SERIAL PRIMARY KEY
 
     # -- 字符串 -------------------------------------------------------
 
-    short_text: str = Field(max_length=100, nullable=True,default="")
+    short_text: str = Field(max_length=200, nullable=True,default="",comment="短字符")
     # max_length 指定 → VARCHAR(100)
 
     free_text: str | None = None
@@ -64,7 +73,7 @@ class AllFieldTypes(Model):
     score: float = Field(default=0)
     # MySQL → DOUBLE,  PG → DOUBLE PRECISION
 
-    price: decimal.Decimal | None = Field(default=0.0,db_type="decimal(8,5)")
+    price: decimal.Decimal | None = Field(default=0.0,db_type="decimal(15,5)")
     # MySQL → DECIMAL(18,6),  PG → DECIMAL(18,6)
 
     # -- 布尔 ---------------------------------------------------------
@@ -105,6 +114,7 @@ class AllFieldTypes(Model):
     # DDL: MySQL DEFAULT (JSON_ARRAY()), PG DEFAULT jsonb_build_array()
     new_field:list = Field(default_factory=list)
     
+    enum_f:FruitEnum = Field(default=FruitEnum.banana)
 ```
 
 

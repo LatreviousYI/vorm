@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as _dt
+import enum
 import json as _json_mod
 import re
 from abc import ABC, abstractmethod
@@ -414,6 +415,12 @@ class AbstractDialect(ABC):
         if "JSON" in sql_type_upper or "JSONB" in sql_type_upper:
             return f"DEFAULT {self._render_json_default_expr(default)}"
 
+        if isinstance(default, enum.Enum):
+            val = default.value
+            if isinstance(val, str):
+                escaped = val.replace("'", "''")
+                return f"DEFAULT '{escaped}'"
+            return f"DEFAULT {val}"
         if isinstance(default, str):
             escaped = default.replace("'", "''")
             return f"DEFAULT '{escaped}'"
@@ -513,6 +520,28 @@ class AbstractDialect(ABC):
             definitions.append(f"  {self._build_column_def(model, field_name, column, info)}")
         columns_sql = ",\n".join(definitions)
         return f"CREATE TABLE IF NOT EXISTS {table} (\n{columns_sql}\n)"
+
+    def build_pre_create(
+        self,
+        model: type[Model],
+        existing_enums: dict[str, set[str]] | None = None,
+    ) -> list[str]:
+        """Return DDL to execute BEFORE CREATE TABLE (e.g., CREATE TYPE for PG enums).
+
+        The base returns an empty list. PostgreSQL overrides this.
+        """
+        return []
+
+    def build_pre_alter(
+        self,
+        model: type[Model],
+        existing_enums: dict[str, set[str]] | None = None,
+    ) -> list[str]:
+        """Return DDL to execute BEFORE ALTER TABLE (e.g., ALTER TYPE ADD VALUE for PG).
+
+        The base returns an empty list. PostgreSQL overrides this.
+        """
+        return []
 
     def build_post_create(self, model: type[Model]) -> list[str]:
         """Return extra DDL to execute after CREATE TABLE (e.g. COMMENT ON COLUMN for PG).
@@ -697,6 +726,13 @@ class AbstractDialect(ABC):
     # 索引
     # ------------------------------------------------------------------
 
+    async def introspect_enum_types(self) -> dict[str, set[str]]:
+        """Return ``{type_name: {value1, value2, ...}}`` for all enum types in the database.
+
+        The base returns an empty dict. PostgreSQL overrides this to query pg_catalog.
+        """
+        return {}
+
     @abstractmethod
     async def introspect_indexes(self, table_name: str) -> set[str]:
         """返回表中已有索引的名称集合（不含主键）。"""
@@ -737,6 +773,8 @@ class AbstractDialect(ABC):
             value = getattr(instance, field_name)
             if info.primary_key and info.auto_increment and value is None:
                 continue
+            if isinstance(value, enum.Enum):
+                value = value.value
             if isinstance(value, dict | list):
                 value = _json_mod.dumps(value)
             field_names.append(field_name)

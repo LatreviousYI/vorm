@@ -139,8 +139,14 @@ class Model(BaseModel, metaclass=ModelMeta):
         永不删除列、表或索引。
         """
         existing = await dialect.introspect_columns(cls.__table__)
+        existing_enums = await dialect.introspect_enum_types()
 
         if not existing:
+            # 建表前 DDL（如 PG 的 CREATE TYPE ... AS ENUM）
+            for pre_sql in dialect.build_pre_create(cls, existing_enums):
+                logger.info("同步表 %s：执行建表前 DDL", cls.__table__)
+                await dialect.execute(pre_sql, [])
+
             sql = dialect.build_create_table(cls)
             print(sql)
             logger.info("同步表 %s：创建表", cls.__table__)
@@ -163,6 +169,14 @@ class Model(BaseModel, metaclass=ModelMeta):
                     modified.append((field_name, matched))
 
             if missing or modified:
+                # 变更前 DDL（如 PG 的 CREATE TYPE / ALTER TYPE ADD VALUE）
+                for pre_sql in dialect.build_pre_create(cls, existing_enums):
+                    logger.info("同步表 %s：执行变更前 DDL", cls.__table__)
+                    await dialect.execute(pre_sql, [])
+                for pre_sql in dialect.build_pre_alter(cls, existing_enums):
+                    logger.info("同步表 %s：执行变更前 DDL", cls.__table__)
+                    await dialect.execute(pre_sql, [])
+
                 logger.info(
                     "同步表 %s：新增 %d 列，修改 %d 列",
                     cls.__table__,
