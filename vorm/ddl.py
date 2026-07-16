@@ -32,6 +32,7 @@ class IntrospectedColumn:
     is_nullable: bool
     column_default: str | None = None
     column_comment: str | None = None
+    is_auto_increment: bool = False
 
 
 def resolve_base_type(annotation: Any) -> type:

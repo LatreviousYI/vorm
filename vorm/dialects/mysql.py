@@ -269,7 +269,7 @@ class MySQLDialect(AbstractDialect):
     async def introspect_columns(self, table_name: str) -> dict[str, IntrospectedColumn]:
         query = (
             "SELECT COLUMN_NAME, COLUMN_TYPE, "
-            "IS_NULLABLE, COLUMN_DEFAULT, COLUMN_COMMENT "
+            "IS_NULLABLE, COLUMN_DEFAULT, COLUMN_COMMENT, EXTRA "
             "FROM INFORMATION_SCHEMA.COLUMNS "
             "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s "
             "ORDER BY ORDINAL_POSITION"
@@ -284,6 +284,7 @@ class MySQLDialect(AbstractDialect):
                 is_nullable=row["IS_NULLABLE"] == "YES",
                 column_default=row.get("COLUMN_DEFAULT"),
                 column_comment=raw_comment if raw_comment else None,
+                is_auto_increment=(row.get("EXTRA") or "").lower() == "auto_increment",
             )
             result[col.column_name.lower()] = col
         return result
@@ -315,18 +316,21 @@ class MySQLDialect(AbstractDialect):
             new_type = self.map_python_type(annotation, info)
 
             old_normalized = self._normalize_type(existing.data_type)
-            new_normalized = new_type.lower()
+            # AUTO_INCREMENT 不在 MySQL COLUMN_TYPE 里，去掉后单独比对
+            new_normalized = new_type.lower().replace(" auto_increment", "")
 
             type_changed = old_normalized != new_normalized
             null_changed = info.nullable != existing.is_nullable
             default_changed = self._default_changed(model, field_name, existing)
             comment_changed = self._comment_changed(model, field_name, existing)
+            auto_increment_changed = info.auto_increment != existing.is_auto_increment
 
             if (
                 not type_changed
                 and not null_changed
                 and not default_changed
                 and not comment_changed
+                and not auto_increment_changed
             ):
                 continue
 
@@ -406,7 +410,8 @@ class MySQLDialect(AbstractDialect):
             new_type = self.map_python_type(annotation, info)
 
             old_normalized = self._normalize_type(existing.data_type)
-            new_normalized = new_type.lower()
+            # AUTO_INCREMENT 不在 MySQL COLUMN_TYPE 里，比对时去掉
+            new_normalized = new_type.lower().replace(" auto_increment", "")
 
             type_changed = old_normalized != new_normalized
             null_changed = info.nullable != existing.is_nullable
