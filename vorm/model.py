@@ -148,7 +148,6 @@ class Model(BaseModel, metaclass=ModelMeta):
                 await dialect.execute(pre_sql, [])
 
             sql = dialect.build_create_table(cls)
-            print(sql)
             logger.info("同步表 %s：创建表", cls.__table__)
             await dialect.execute(sql, [])
             # 建表后额外 DDL（如 PG 的 COMMENT ON COLUMN）
