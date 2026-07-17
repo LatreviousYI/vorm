@@ -1,6 +1,6 @@
 [project]
 name = "vorm"
-version = "0.1.1"
+version = "0.1.2"
 description = "Async ORM for MySQL and PostgreSQL, powered by Pydantic v2"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -38,6 +38,11 @@ ignore_missing_imports = true
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "fastapi[standard]>=0.139.2",
+]
 
 
 [[tool.uv.index]]

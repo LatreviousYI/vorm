@@ -242,9 +242,16 @@ class PostgreSQLDialect(AbstractDialect):
     async def introspect_columns(self, table_name: str) -> dict[str, IntrospectedColumn]:
         query = (
             "SELECT column_name, "
-            "CASE WHEN character_maximum_length IS NOT NULL "
-            "  THEN data_type || '(' || character_maximum_length || ')' "
-            "  ELSE data_type END AS data_type, "
+            "CASE "
+            "  WHEN character_maximum_length IS NOT NULL "
+            "    THEN data_type || '(' || character_maximum_length || ')' "
+            "  WHEN data_type IN ('numeric', 'decimal') "
+            "       AND numeric_precision IS NOT NULL "
+            "    THEN data_type || '(' || numeric_precision "
+            "         || ',' || COALESCE(numeric_scale, 0) || ')' "
+            "  WHEN data_type = 'USER-DEFINED' THEN udt_name "
+            "  ELSE data_type "
+            "END AS data_type, "
             "is_nullable, column_default "
             "FROM information_schema.columns "
             "WHERE table_catalog = current_database() AND table_name = $1 "
@@ -393,7 +400,7 @@ class PostgreSQLDialect(AbstractDialect):
                     result.append(f"COMMENT ON COLUMN {tbl}.{col} IS NULL")
 
         # 为 auto_increment 主键创建序列 + SET DEFAULT（PG 升级 BIGINT → BIGSERIAL）
-        for field_name, _existing in modified:
+        for field_name, existing in modified:
             info = model.__column_info__[field_name]
             if not (info.auto_increment and info.primary_key):
                 continue
@@ -410,6 +417,11 @@ class PostgreSQLDialect(AbstractDialect):
             col = self.quote_identifier(column.column_name)
             seq_name = f"{model.__table__}_{column.column_name}_seq"
             seq_quoted = self.quote_identifier(seq_name)
+
+            # 已有 nextval 默认值 → 跳过（幂等：序列已存在且默认值已设置）
+            existing_default = (existing.column_default or "").lower()
+            if "nextval" in existing_default:
+                continue
 
             result.append(f"CREATE SEQUENCE IF NOT EXISTS {seq_quoted} OWNED BY {tbl}.{col}")
             result.append(f"ALTER TABLE {tbl} ALTER COLUMN {col} SET DEFAULT nextval('{seq_name}')")
