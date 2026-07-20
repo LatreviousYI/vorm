@@ -257,9 +257,9 @@ class ReturnJoinTableSecond(Model):
     j_ss_t:str|None
 
 
-# 后续可以使用pydantic提供的功能反序列化到pydantic模型中
-adapter = TypeAdapter(list[ReturnJoinTableSecond])
-e: list[ReturnJoinTableSecond] = adapter.validate_python(d)
+# 后续可以使用serialization提供的功能反序列化到pydantic模型中
+from vorm.query import serialization
+data = serialization(ReturnJoinTableSecond,d)
 
 ```
 

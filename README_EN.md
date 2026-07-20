@@ -265,9 +265,9 @@ class ReturnJoinTableSecond(Model):
     j_s_t: str | None = None
     j_ss_t: str | None = None
 
-from pydantic import TypeAdapter
-adapter = TypeAdapter(list[ReturnJoinTableSecond])
-result: list[ReturnJoinTableSecond] = adapter.validate_python(rows)
+from vorm.query import serialization
+
+result = serialization(ReturnJoinTableSecond,rows)
 ```
 
 ### 7. Transactions & Health Check

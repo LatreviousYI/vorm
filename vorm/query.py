@@ -4,12 +4,15 @@ import json as _json_mod
 from dataclasses import dataclass
 from typing import Any, Generic, TypeVar, cast
 
+from pydantic import BaseModel, TypeAdapter
+
 from vorm.exceptions import DoesNotExist, MultipleObjectsReturned
 from vorm.expression import AliasedColumn, Column, Expression, OrderExpression
 from vorm.model import Model
 from vorm.row import Row
 
 ModelT = TypeVar("ModelT", bound=Model)
+SerializationModel = TypeVar("SerializationModel", bound=BaseModel)
 
 
 @dataclass
@@ -168,3 +171,8 @@ class QuerySet(Generic[ModelT]):
         sql, params = self.session.dialect.build_delete_by_query(self)
         result = await self.session.dialect.execute(sql, params)
         return int(result) if result is not None else 0
+
+
+def serialization(model: type[SerializationModel], data: Any) -> list[SerializationModel]:
+    adapter: TypeAdapter[list[SerializationModel]] = TypeAdapter(list[model])  # type: ignore[valid-type]
+    return adapter.validate_python(data)
