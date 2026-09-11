@@ -196,6 +196,27 @@ class PostgreSQLDialect(AbstractDialect):
             return "BIGINT"
         return sql_type
 
+    def column_changed(
+        self,
+        model: type[Model],
+        field_name: str,
+        existing: IntrospectedColumn,
+    ) -> bool:
+        """PG：在基类比对之外，auto_increment 主键尚未有序列默认值时也算需修改。"""
+        if super().column_changed(model, field_name, existing):
+            return True
+
+        info = model.__column_info__[field_name]
+        if not (info.auto_increment and info.primary_key):
+            return False
+
+        new_type = self.map_python_type(model.model_fields[field_name].annotation, info).upper()
+        if new_type not in ("SERIAL", "BIGSERIAL"):
+            return False
+
+        # 已有 nextval 默认值 → 序列已就绪，无需处理
+        return "nextval" not in (existing.column_default or "").lower()
+
     def map_python_type(self, annotation: Any, column_info: ColumnInfo) -> str:
         if column_info.db_type is not None:
             db = column_info.db_type.upper()

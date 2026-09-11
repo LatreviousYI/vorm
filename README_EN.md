@@ -127,7 +127,7 @@ class AllFieldTypes(Model):
 
 ```python
 import datetime
-from vorm import Field, Model
+from vorm import Field, Model, col
 from vorm.ddl import Index
 
 class Article(Model):
@@ -196,7 +196,7 @@ await session.query(Article).filter(Article.id == 1).one()                  # Ex
 await session.query(Article).filter(Article.title.like("Post%")).first()    # First or None
 await session.query(Article).count()                                        # Count
 await session.query(Article).filter(Article.id == 1).exists()               # Existence check
-await session.query(Article).order_by(Article.id.desc()).limit(10).offset(20).all()  # Pagination
+await session.query(Article).order_by(col(Article.id).desc()).limit(10).offset(20).all()  # Pagination
 
 # UPDATE
 article.view_count += 1
@@ -209,24 +209,47 @@ await session.delete(article)
 await session.query(Article).filter(Article.view_count == 0).delete()      # Batch
 ```
 
+### Sorting (ORDER BY)
+
+Wrap class-level fields with `col()` before calling a method to silence the type-checker's false positive:
+
+```python
+from vorm import col
+
+# Single field
+await session.query(Article).order_by(col(Article.id).desc()).all()
+await session.query(Article).order_by(col(Article.id).asc()).all()
+
+# Multiple fields: applied in the order given
+await session.query(Article).order_by(
+    col(Article.view_count).desc(),  # view_count descending
+    col(Article.id).asc(),           # then id ascending
+).all()
+
+# Bare fields default to ascending; mix with desc()/asc()
+await session.query(Article).order_by(Article.status, col(Article.created_at).desc()).all()
+```
+
+> At runtime `Article.id` is already a `Column` (via the metaclass), so `Article.id.desc()` works; but a static type checker sees the field as its value type (`int`) and reports "`int` has no `desc`". Wrapping it as `col(Article.id)` re-types it as `Column` and removes the false positive. `col()` applies to every `Column` method — `.like()`, `.in_()`, `.between()`, `.is_null()`, `.json_path()`, and so on.
+
 ### 5. Advanced Queries
 
 ```python
 # LIKE / BETWEEN
-await session.query(User).filter(User.name.like("A%")).all()
-await session.query(Book).filter(Book.price.between(10, 50)).all()
+await session.query(User).filter(col(User.name).like("A%")).all()
+await session.query(Book).filter(col(Book.price).between(10, 50)).all()
 
 # IN / IS NULL
-await session.query(User).filter(User.role.in_(["admin", "editor"])).all()
-await session.query(User).filter(User.email.is_null()).all()
+await session.query(User).filter(col(User.role).in_(["admin", "editor"])).all()
+await session.query(User).filter(col(User.email).is_null()).all()
 
 # AND / OR
 cond = (User.age >= 18) & (User.role == "member")       # AND
 cond = (User.role == "admin") | (User.role == "staff")   # OR
 
 # JSON path queries
-await session.query(Article).filter(Article.tags.json_path("$[0]") == "tech").all()
-await session.query(Product).filter(Product.data.json_path("$.price") > 100).all()
+await session.query(Article).filter(col(Article.tags).json_path("$[0]") == "tech").all()
+await session.query(Product).filter(col(Product.data).json_path("$.price") > 100).all()
 ```
 
 ### 6. Multi-table JOIN
@@ -235,7 +258,7 @@ await session.query(Product).filter(Product.data.json_path("$.price") > 100).all
 # Two-table INNER JOIN
 rows = await session.query(Author).join(
     Book, on=Author.id == Book.author_id
-).filter(Book.price > 20).order_by(Author.name.asc()).all()
+).filter(Book.price > 20).order_by(col(Author.name).asc()).all()
 
 # LEFT JOIN
 rows = await session.query(Author).join(

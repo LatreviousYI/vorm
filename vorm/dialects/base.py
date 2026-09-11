@@ -510,6 +510,29 @@ class AbstractDialect(ABC):
         db_comment = (existing.column_comment or "").strip()
         return expected != db_comment
 
+    def column_changed(
+        self,
+        model: type[Model],
+        field_name: str,
+        existing: IntrospectedColumn,
+    ) -> bool:
+        """Return ``True`` if this column needs any ALTER / post-alter DDL.
+
+        作为 ``sync_table`` 判断"哪些列真正需要修改"的单一真相源。注释变更也计入
+        （PG 通过 ``build_post_alter`` 处理 ``COMMENT ON COLUMN``，不属于类型/默认值比对）。
+        """
+        info = model.__column_info__[field_name]
+        annotation = model.model_fields[field_name].annotation
+        new_type = self.map_python_type(annotation, info)
+
+        type_changed = (
+            self._normalize_type(existing.data_type) != self._alter_column_type(new_type).lower()
+        )
+        null_changed = info.nullable != existing.is_nullable
+        default_changed = self._default_changed(model, field_name, existing)
+        comment_changed = self._comment_changed(model, field_name, existing)
+        return type_changed or null_changed or default_changed or comment_changed
+
     def build_create_table(self, model: type[Model]) -> str:
         """生成 ``CREATE TABLE IF NOT EXISTS ...`` 语句。"""
         table = self.quote_identifier(model.__table__)

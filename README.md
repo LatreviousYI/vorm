@@ -128,7 +128,7 @@ class AllFieldTypes(BaseField):
 
 ```python
 import datetime
-from vorm import Field, Model
+from vorm import Field, Model, col
 from vorm.ddl import Index
 
 class Article(Model):
@@ -191,7 +191,7 @@ await session.query(Article).filter(Article.id == 1).one()     # 精确一条
 await session.query(Article).filter(Article.title.like("Post%")).first()  # 有则返无则 None
 await session.query(Article).count()                            # 计数
 await session.query(Article).filter(Article.id == 1).exists()  # 存在性
-await session.query(Article).order_by(Article.id.desc()).limit(10).offset(20).all()  # 分页
+await session.query(Article).order_by(col(Article.id).desc()).limit(10).offset(20).all()  # 分页
 
 # UPDATE
 article.view_count += 1
@@ -203,24 +203,47 @@ await session.delete(article)
 await session.query(Article).filter(Article.view_count == 0).delete()  # 批量
 ```
 
+### 排序（ORDER BY）
+
+用 `col()` 包裹类级字段再调用方法，可消除类型检查器对类级字段的误报：
+
+```python
+from vorm import col
+
+# 单字段
+await session.query(Article).order_by(col(Article.id).desc()).all()
+await session.query(Article).order_by(col(Article.id).asc()).all()
+
+# 多字段：按传入顺序依次排序
+await session.query(Article).order_by(
+    col(Article.view_count).desc(),  # 先按浏览量降序
+    col(Article.id).asc(),           # 再按 id 升序
+).all()
+
+# 裸字段默认升序，可与 desc()/asc() 混用
+await session.query(Article).order_by(Article.status, col(Article.created_at).desc()).all()
+```
+
+> 运行时 `Article.id` 经元类拦截本就是 `Column`，`Article.id.desc()` 也能跑通；但静态类型检查器把类级字段注解为值类型 `int`，会报「`int` 无 `desc` 属性」。用 `col(Article.id)` 把它重新标注为 `Column` 即可消除误报。`col()` 对 `.like()`、`.in_()`、`.between()`、`.is_null()`、`.json_path()` 等所有 Column 方法同样适用。
+
 ### 5. 高级查询
 
 ```python
 # LIKE / BETWEEN
-await session.query(User).filter(User.name.like("张%")).all()
-await session.query(Book).filter(Book.price.between(10, 50)).all()
+await session.query(User).filter(col(User.name).like("张%")).all()
+await session.query(Book).filter(col(Book.price).between(10, 50)).all()
 
 # IN / IS NULL
-await session.query(User).filter(User.role.in_(["admin", "editor"])).all()
-await session.query(User).filter(User.email.is_null()).all()
+await session.query(User).filter(col(User.role).in_(["admin", "editor"])).all()
+await session.query(User).filter(col(User.email).is_null()).all()
 
 # AND / OR
 cond = (User.age >= 18) & (User.role == "member")       # AND
 cond = (User.role == "admin") | (User.role == "staff")   # OR
 
 # JSON 路径查询（MySQL: column->>'$.path' / PG: column->'key'->>'sub'）
-await session.query(Article).filter(Article.tags.json_path("$[0]") == "tech").all()
-await session.query(Product).filter(Product.data.json_path("$.price") > 100).all()
+await session.query(Article).filter(col(Article.tags).json_path("$[0]") == "tech").all()
+await session.query(Product).filter(col(Product.data).json_path("$.price") > 100).all()
 ```
 
 ### 6. 多表 JOIN
@@ -229,7 +252,7 @@ await session.query(Product).filter(Product.data.json_path("$.price") > 100).all
 # 两表 INNER JOIN
 rows = await session.query(Author).join(
     Book, on=Author.id == Book.author_id
-).filter(Book.price > 20).order_by(Author.name.asc()).all()
+).filter(Book.price > 20).order_by(col(Author.name).asc()).all()
 
 # LEFT JOIN
 rows = await session.query(Author).join(

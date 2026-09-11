@@ -562,6 +562,43 @@ async def test_sync_table_noop_when_all_columns_exist() -> None:
     assert len(dialect.executed_sqls) == 0
 
 
+class _CaptureAlterDialect(RecordingDDLDialect):
+    """记录传给 build_sync_alter 的修改列，用于验证 sync_table 的列变更判定。"""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.modify_pairs: list[tuple[str, IntrospectedColumn]] = []
+
+    def build_sync_alter(
+        self,
+        model: type[Model],
+        add_fields: list[str],
+        modify_pairs: list[tuple[str, IntrospectedColumn]],
+    ) -> str:
+        self.modify_pairs = list(modify_pairs)
+        return super().build_sync_alter(model, add_fields, modify_pairs)
+
+
+async def test_sync_table_reports_no_modified_columns_when_all_match() -> None:
+    """重复同步时所有列都匹配，不应有任何列被误判为"修改"。"""
+    existing = {
+        "id": IntrospectedColumn("id", "serial", is_nullable=False),
+        "name": IntrospectedColumn("name", "varchar(100)", is_nullable=False),
+        "email": IntrospectedColumn("email", "text", is_nullable=True),
+        "age": IntrospectedColumn("age", "integer", is_nullable=True),
+        "is_active": IntrospectedColumn(
+            "is_active", "boolean", is_nullable=True, column_default="true"
+        ),
+    }
+    dialect = _CaptureAlterDialect(introspect_result=existing)
+    session = Session(dialect)
+
+    await User.sync_table(session.dialect)
+
+    assert dialect.modify_pairs == []
+    assert len(dialect.executed_sqls) == 0
+
+
 async def test_sync_table_case_insensitive_match() -> None:
     """列名匹配应大小写不敏感。"""
     # 真实 DB 返回大写列名 "ID"，但 introspect_columns 将其 key 小写化
@@ -642,6 +679,32 @@ def test_build_modify_columns_no_diff_skips(dialect: DDLDialect) -> None:
 
     # 类型匹配（varchar(100) == VARCHAR(100) 大小写不敏感）、null 匹配 → 无 SQL
     assert sql == ""
+
+
+def test_column_changed_no_diff(dialect: DDLDialect) -> None:
+    """类型 / null / 默认值 / 注释都匹配 → 判定为无需修改。"""
+    existing = IntrospectedColumn("name", "varchar(100)", is_nullable=False)
+    assert dialect.column_changed(User, "name", existing) is False
+
+
+def test_column_changed_type_diff(dialect: DDLDialect) -> None:
+    """类型不一致 → 判定为需要修改。"""
+    existing = IntrospectedColumn("name", "varchar(50)", is_nullable=False)
+    assert dialect.column_changed(User, "name", existing) is True
+
+
+def test_column_changed_null_diff(dialect: DDLDialect) -> None:
+    """null 约束不一致 → 判定为需要修改。"""
+    existing = IntrospectedColumn("name", "varchar(100)", is_nullable=True)
+    assert dialect.column_changed(User, "name", existing) is True
+
+
+def test_column_changed_comment_diff(dialect: DDLDialect) -> None:
+    """注释不一致 → 判定为需要修改（PG 由 build_post_alter 处理 COMMENT）。"""
+    existing = IntrospectedColumn(
+        "name", "varchar(100)", is_nullable=True, column_comment="Old comment"
+    )
+    assert dialect.column_changed(CommentModel, "name", existing) is True
 
 
 # ---------------------------------------------------------------------------
@@ -1786,3 +1849,21 @@ async def test_sync_table_skips_existing_enum_type():
     # pre_create 为空，只有 CREATE TABLE
     assert len(dialect.executed_sqls) == 1
     assert "CREATE TABLE" in dialect.executed_sqls[0]
+
+
+async def test_sync_table_adds_new_enum_value_without_column_change():
+    """表已存在、列类型不变，仅枚举新增了值时，仍应执行 ALTER TYPE ADD VALUE。"""
+    existing = {
+        "id": IntrospectedColumn("id", "serial", is_nullable=False),
+        "status": IntrospectedColumn("status", "_teststrenum", is_nullable=True),
+    }
+    dialect = RecordingDDLDialect(
+        introspect_result=existing,
+        introspect_enums={"_teststrenum": {"draft"}},  # DB 缺少 published / archived
+    )
+    session = Session(dialect)
+
+    await _SyncEnumModel.sync_table(session.dialect)
+
+    alter_type_sqls = [s for s in dialect.executed_sqls if "ALTER TYPE" in s]
+    assert len(alter_type_sqls) == 2  # published + archived

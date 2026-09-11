@@ -210,6 +210,25 @@ class MySQLDialect(AbstractDialect):
 
         return _strip_quotes(expected_normalized) != _strip_quotes(db_normalized)
 
+    def column_changed(
+        self,
+        model: type[Any],
+        field_name: str,
+        existing: IntrospectedColumn,
+    ) -> bool:
+        """MySQL：类型比对时忽略 ``AUTO_INCREMENT`` 后缀（COLUMN_TYPE 不包含它）。"""
+        info = model.__column_info__[field_name]
+        annotation = model.model_fields[field_name].annotation
+        new_type = self.map_python_type(annotation, info)
+
+        # AUTO_INCREMENT 不在 MySQL COLUMN_TYPE 里，去掉后单独比对
+        new_normalized = new_type.lower().replace(" auto_increment", "")
+        type_changed = self._normalize_type(existing.data_type) != new_normalized
+        null_changed = info.nullable != existing.is_nullable
+        default_changed = self._default_changed(model, field_name, existing)
+        comment_changed = self._comment_changed(model, field_name, existing)
+        return type_changed or null_changed or default_changed or comment_changed
+
     def map_python_type(self, annotation: Any, column_info: ColumnInfo) -> str:
         if column_info.db_type is not None:
             t = column_info.db_type

@@ -164,18 +164,19 @@ class Model(BaseModel, metaclass=ModelMeta):
                 matched = existing.get(expected_name)
                 if matched is None:
                     missing.append(field_name)
-                else:
+                elif dialect.column_changed(cls, field_name, matched):
                     modified.append((field_name, matched))
 
-            if missing or modified:
-                # 变更前 DDL（如 PG 的 CREATE TYPE / ALTER TYPE ADD VALUE）
-                for pre_sql in dialect.build_pre_create(cls, existing_enums):
-                    logger.info("同步表 %s：执行变更前 DDL", cls.__table__)
-                    await dialect.execute(pre_sql, [])
-                for pre_sql in dialect.build_pre_alter(cls, existing_enums):
-                    logger.info("同步表 %s：执行变更前 DDL", cls.__table__)
-                    await dialect.execute(pre_sql, [])
+            # 变更前 DDL（如 PG 的 CREATE TYPE / ALTER TYPE ADD VALUE）。
+            # 与列变更无关，表存在即执行（幂等，内部跳过已存在的类型/枚举值）。
+            for pre_sql in dialect.build_pre_create(cls, existing_enums):
+                logger.info("同步表 %s：执行变更前 DDL", cls.__table__)
+                await dialect.execute(pre_sql, [])
+            for pre_sql in dialect.build_pre_alter(cls, existing_enums):
+                logger.info("同步表 %s：执行变更前 DDL", cls.__table__)
+                await dialect.execute(pre_sql, [])
 
+            if missing or modified:
                 logger.info(
                     "同步表 %s：新增 %d 列，修改 %d 列",
                     cls.__table__,

@@ -1,4 +1,5 @@
 from vorm.engine import Engine, create_mysql_engine, create_postgresql_engine
+from vorm.expression import col
 from vorm.fields import Field
 from vorm.model import Model
 from vorm.row import Row
@@ -10,6 +11,7 @@ __all__ = [
     "Row",
     "Session",
     "Engine",
+    "col",
     "connect_mysql",
     "connect_postgresql",
     "create_mysql_engine",

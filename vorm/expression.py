@@ -235,3 +235,19 @@ class Column:
 
     def between(self, low: Any, high: Any) -> BetweenExpression:
         return BetweenExpression(self, low, high)
+
+
+def col(column: Any) -> Column:
+    """返回类级字段对应的 ``Column``，规避静态类型检查器的误报。
+
+    运行时 ``Settings.id`` 经元类 ``__getattribute__`` 拦截本就是 ``Column``，
+    但静态类型检查器（Pyright/Pylance）把它注解为值类型（``int``/``str`` 等），
+    于是 ``Settings.id.in_([1, 2, 3])`` 会报「``int`` 无 ``in_`` 属性」，
+    尽管运行时能正常工作。用 ``col()`` 把参数重新标注为 ``Column`` 即可：
+
+        col(Settings.id).in_([1, 2, 3])
+        col(Article.id).desc()
+
+    本质是带类型标注的恒等函数，运行时原样返回传入的 ``Column``。
+    """
+    return column

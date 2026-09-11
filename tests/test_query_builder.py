@@ -4,7 +4,7 @@ from typing import Any
 
 import pytest
 
-from vorm import Field, Model, Session
+from vorm import Field, Model, Session, col
 from vorm.dialects.base import AbstractDialect
 
 
@@ -81,6 +81,24 @@ def test_build_select_with_filters_order_limit_offset(session: Session) -> None:
         'ORDER BY "users"."name" DESC LIMIT $3 OFFSET $4'
     )
     assert params == [18, "Bob", 10, 20]
+
+
+def test_order_by_desc_col(session: Session) -> None:
+    """col() 返回 Column，链式 .desc() 与直接 column.desc() 等价。"""
+    query = session.query(User).order_by(col(User.name).desc())
+
+    sql, _ = query.build_sql()
+
+    assert 'ORDER BY "users"."name" DESC' in sql
+
+
+def test_order_by_asc_col(session: Session) -> None:
+    """col() 返回 Column，链式 .asc() 与直接 column.asc() 等价。"""
+    query = session.query(User).order_by(col(User.name).asc())
+
+    sql, _ = query.build_sql()
+
+    assert 'ORDER BY "users"."name" ASC' in sql
 
 
 def test_build_insert_skips_empty_auto_increment_pk(session: Session) -> None:
