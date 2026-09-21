@@ -454,6 +454,61 @@ class MySQLDialect(AbstractDialect):
         sep = ",\n  "
         return f"ALTER TABLE {table}\n  {sep.join(clauses)}"
 
+    def build_schema_sync(
+        self,
+        model: type[Any],
+        *,
+        table_exists: bool,
+        add_fields: list[str],
+        modify_pairs: list[tuple[str, IntrospectedColumn]],
+        existing_index_names: set[str],
+        pre_statements: list[str],
+        post_statements: list[str],
+    ) -> str:
+        """将同一张表的列变更和索引变更合并为一条 MySQL ALTER TABLE。"""
+        statements = list(pre_statements)
+        table = self.quote_identifier(model.__table__)
+
+        index_clauses: list[str] = []
+        model_columns = model.__columns__
+        for idx in model.__indexes__:
+            name = idx.index_name(model.__table__)
+            if name in existing_index_names:
+                continue
+            columns = ", ".join(
+                self.quote_identifier(model_columns[field_name].column_name)
+                for field_name in idx.fields
+            )
+            unique = "UNIQUE " if idx.unique else ""
+            index_clauses.append(f"ADD {unique}INDEX {self.quote_identifier(name)} ({columns})")
+
+        if table_exists:
+            alter_sql = self.build_sync_alter(model, add_fields, modify_pairs)
+            alter_clauses: list[str] = []
+            if alter_sql:
+                _, _, clause_text = alter_sql.partition("\n")
+                alter_clauses.append(clause_text.strip())
+            alter_clauses.extend(index_clauses)
+            if alter_clauses:
+                statements.append(f"ALTER TABLE {table}\n  " + ",\n  ".join(alter_clauses))
+        else:
+            # MySQL 支持在 CREATE TABLE 中声明索引，首次建表也只需一条语句。
+            create_sql = self.build_create_table(model)
+            if index_clauses:
+                index_definitions = [clause.removeprefix("ADD ") for clause in index_clauses]
+                closing = "\n)"
+                if create_sql.endswith(closing):
+                    create_sql = (
+                        create_sql[: -len(closing)]
+                        + ",\n"
+                        + ",\n".join(f"  {definition}" for definition in index_definitions)
+                        + closing
+                    )
+            statements.append(create_sql)
+
+        statements.extend(post_statements)
+        return self.build_ddl_batch(statements)
+
     def _render_json_default_expr(self, value: Any) -> str:
         """MySQL 使用 ``JSON_OBJECT`` / ``JSON_ARRAY`` 原生函数。"""
         from vorm.dialects.base import _render_json_default_expr

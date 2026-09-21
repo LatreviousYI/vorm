@@ -133,66 +133,51 @@ class Model(BaseModel, metaclass=ModelMeta):
     async def sync_table(cls, dialect: AbstractDialect) -> None:
         """创建或同步数据库表（只增改不删）。
 
-        表不存在时执行 ``CREATE TABLE IF NOT EXISTS``；
-        表存在时为新增字段和修改列合并为一条 ``ALTER TABLE``；
-        随后同步缺失的索引（``CREATE INDEX``，只增不删）。
+        表不存在时执行 ``CREATE TABLE IF NOT EXISTS``；表存在时为新增字段和修改列
+        合并为一条 ``ALTER TABLE``。本次同步产生的建表、列、索引和方言扩展 DDL
+        会按依赖顺序合并为一个批次，并通过一次 ``execute`` 发送。
         永不删除列、表或索引。
         """
+        model_cls: type[Model] = cls
         existing = await dialect.introspect_columns(cls.__table__)
         existing_enums = await dialect.introspect_enum_types()
+        table_exists = bool(existing)
 
-        if not existing:
-            # 建表前 DDL（如 PG 的 CREATE TYPE ... AS ENUM）
-            for pre_sql in dialect.build_pre_create(cls, existing_enums):
-                logger.info("同步表 %s：执行建表前 DDL", cls.__table__)
-                await dialect.execute(pre_sql, [])
-
-            sql = dialect.build_create_table(cls)
-            logger.info("同步表 %s：创建表", cls.__table__)
-            await dialect.execute(sql, [])
-            # 建表后额外 DDL（如 PG 的 COMMENT ON COLUMN）
-            for extra_sql in dialect.build_post_create(cls):
-                logger.info("同步表 %s：执行建表后 DDL", cls.__table__)
-                await dialect.execute(extra_sql, [])
-        else:
-            # 收集新增列和待修改列
-            missing: list[str] = []
-            modified: list[tuple[str, Any]] = []  # (field_name, IntrospectedColumn)
-
+        missing: list[str] = []
+        modified: list[tuple[str, Any]] = []
+        if table_exists:
             for field_name, info in cls.__column_info__.items():
                 expected_name = (info.column_name or field_name).lower()
                 matched = existing.get(expected_name)
                 if matched is None:
                     missing.append(field_name)
-                elif dialect.column_changed(cls, field_name, matched):
+                elif dialect.column_changed(model_cls, field_name, matched):
                     modified.append((field_name, matched))
 
-            # 变更前 DDL（如 PG 的 CREATE TYPE / ALTER TYPE ADD VALUE）。
-            # 与列变更无关，表存在即执行（幂等，内部跳过已存在的类型/枚举值）。
-            for pre_sql in dialect.build_pre_create(cls, existing_enums):
-                logger.info("同步表 %s：执行变更前 DDL", cls.__table__)
-                await dialect.execute(pre_sql, [])
-            for pre_sql in dialect.build_pre_alter(cls, existing_enums):
-                logger.info("同步表 %s：执行变更前 DDL", cls.__table__)
-                await dialect.execute(pre_sql, [])
+        # DDL 的依赖顺序由 build_schema_sync 统一组织：枚举/类型准备、建表或
+        # ALTER、索引，最后是注释/序列等后置操作。
+        pre_statements: list[str] = []
+        post_statements: list[str] = []
+        if not table_exists:
+            pre_statements.extend(dialect.build_pre_create(model_cls, existing_enums))
+            post_statements.extend(dialect.build_post_create(model_cls))
+        else:
+            pre_statements.extend(dialect.build_pre_create(model_cls, existing_enums))
+            pre_statements.extend(dialect.build_pre_alter(model_cls, existing_enums))
+            post_statements.extend(
+                dialect.build_post_alter(model_cls, modified, add_fields=missing)
+            )
 
-            if missing or modified:
-                logger.info(
-                    "同步表 %s：新增 %d 列，修改 %d 列",
-                    cls.__table__,
-                    len(missing),
-                    len(modified),
-                )
-                sql = dialect.build_sync_alter(cls, missing, modified)
-                if sql:
-                    await dialect.execute(sql, [])
-                # 额外 DDL（如 PG 创建序列）
-                for extra_sql in dialect.build_post_alter(cls, modified, add_fields=missing):
-                    logger.info("同步表 %s：执行额外 DDL", cls.__table__)
-                    await dialect.execute(extra_sql, [])
-
-        # -- 索引同步（只增不删） --
         existing_indexes = await dialect.introspect_indexes(cls.__table__)
-        for sql in dialect.build_sync_indexes(cls, existing_indexes):
-            logger.info("同步表 %s：创建索引", cls.__table__)
+        sql = dialect.build_schema_sync(
+            model_cls,
+            table_exists=table_exists,
+            add_fields=missing,
+            modify_pairs=modified,
+            existing_index_names=existing_indexes,
+            pre_statements=pre_statements,
+            post_statements=post_statements,
+        )
+        if sql:
+            logger.info("同步表 %s：执行 DDL 批次", cls.__table__)
             await dialect.execute(sql, [])

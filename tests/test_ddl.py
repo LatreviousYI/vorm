@@ -9,6 +9,7 @@ import pytest
 from vorm import Field, Model, Session
 from vorm.ddl import Index, IntrospectedColumn
 from vorm.dialects.base import AbstractDialect
+from vorm.dialects.mysql import MySQLDialect
 from vorm.fields import ColumnInfo
 
 # ---------------------------------------------------------------------------
@@ -775,9 +776,46 @@ async def test_sync_table_new_columns_and_modifications_combined() -> None:
     assert "ALTER COLUMN" in sql or "MODIFY" in sql
 
 
-# ---------------------------------------------------------------------------
-# 默认值变更检测
-# ---------------------------------------------------------------------------
+async def test_sync_table_new_columns_modifications_and_indexes_are_one_batch() -> None:
+    """一张表的列新增、列修改和缺失索引应只调用一次 DDL execute。"""
+    existing = {
+        "id": IntrospectedColumn("id", "serial", is_nullable=False),
+        # name 的长度变化触发 MODIFY，其余字段视为新增
+        "name": IntrospectedColumn("name", "varchar(50)", is_nullable=False),
+    }
+    dialect = RecordingDDLDialect(
+        introspect_result=existing,
+        introspect_indexes=set(),
+    )
+
+    await IndexedModel.sync_table(dialect)
+
+    assert len(dialect.executed_sqls) == 1
+    sql = dialect.executed_sqls[0]
+    assert "ALTER TABLE" in sql
+    assert "ADD COLUMN" in sql
+    assert "ALTER COLUMN" in sql
+    assert sql.count(" INDEX ") == 3
+
+
+async def test_sync_table_postgres_style_extras_are_one_batch() -> None:
+    """PG 风格的 ALTER、列注释等额外 DDL 应按依赖顺序一次发送。"""
+    existing = {
+        "id": IntrospectedColumn("id", "serial", is_nullable=False),
+        "name": IntrospectedColumn(
+            "name", "varchar(100)", is_nullable=True, column_comment="Old name"
+        ),
+        # email 和 bio 缺失，新增 email 需要 COMMENT
+    }
+    dialect = RecordingDDLDialect(introspect_result=existing)
+
+    await CommentModel.sync_table(dialect)
+
+    assert len(dialect.executed_sqls) == 1
+    sql = dialect.executed_sqls[0]
+    assert "ALTER TABLE" in sql
+    assert "COMMENT ON COLUMN" in sql
+    assert sql.index("ALTER TABLE") < sql.index("COMMENT ON COLUMN")
 
 
 class DefaultTestModel(Model):
@@ -950,7 +988,7 @@ def test_build_sync_indexes_skips_existing(dialect: DDLDialect) -> None:
 
 
 async def test_sync_table_creates_indexes() -> None:
-    """sync_table 应在建表后创建缺失的索引。"""
+    """sync_table 应把全部缺失索引合并为一次 DDL 执行。"""
     existing_cols = {
         "id": IntrospectedColumn("id", "serial", is_nullable=False),
         "name": IntrospectedColumn("name", "varchar(100)", is_nullable=False),
@@ -966,10 +1004,12 @@ async def test_sync_table_creates_indexes() -> None:
 
     await IndexedModel.sync_table(session.dialect)
 
-    # ALTER TABLE（列已全匹配，无变更）+ 3 条 CREATE INDEX
-    assert len(dialect.executed_sqls) == 3
-    # 全部是 CREATE INDEX
-    assert all("CREATE" in s and "INDEX" in s for s in dialect.executed_sqls)
+    assert len(dialect.executed_sqls) == 1
+    sql = dialect.executed_sqls[0]
+    assert sql.count(" INDEX ") == 3
+    assert "ix_indexed_name_age" in sql
+    assert "unq_indexed_email" in sql
+    assert "idx_custom" in sql
 
 
 async def test_sync_table_skips_existing_indexes() -> None:
@@ -1112,21 +1152,20 @@ def test_build_post_alter_comment_removed(dialect: DDLDialect) -> None:
 
 
 async def test_sync_table_creates_with_comments() -> None:
-    """新建表时：CREATE TABLE + COMMENT ON COLUMN（通过 build_post_create）。"""
+    """新建表时，CREATE TABLE 与列注释只发送一个 DDL 批次。"""
     dialect = RecordingDDLDialect(introspect_result={})
     session = Session(dialect)
 
     await CommentModel.sync_table(session.dialect)
 
-    # CREATE TABLE + 2 COMMENT ON COLUMN
-    assert len(dialect.executed_sqls) == 3
-    assert "CREATE TABLE IF NOT EXISTS" in dialect.executed_sqls[0]
-    assert "COMMENT ON COLUMN" in dialect.executed_sqls[1]
-    assert "COMMENT ON COLUMN" in dialect.executed_sqls[2]
+    assert len(dialect.executed_sqls) == 1
+    sql = dialect.executed_sqls[0]
+    assert "CREATE TABLE IF NOT EXISTS" in sql
+    assert sql.count("COMMENT ON COLUMN") == 2
 
 
 async def test_sync_table_add_column_with_comment() -> None:
-    """新增带注释列时：ALTER TABLE ADD COLUMN + COMMENT ON COLUMN。"""
+    """新增带注释列时，ALTER TABLE 与列注释只发送一个 DDL 批次。"""
     existing = {
         "id": IntrospectedColumn("id", "serial", is_nullable=False),
     }
@@ -1135,11 +1174,11 @@ async def test_sync_table_add_column_with_comment() -> None:
 
     await CommentModel.sync_table(session.dialect)
 
-    alter_sqls = [s for s in dialect.executed_sqls if "ALTER TABLE" in s]
-    comment_sqls = [s for s in dialect.executed_sqls if "COMMENT ON COLUMN" in s]
-    assert len(alter_sqls) == 1
-    assert len(comment_sqls) == 2  # name + email
-    assert any("User display name" in s for s in comment_sqls)
+    assert len(dialect.executed_sqls) == 1
+    sql = dialect.executed_sqls[0]
+    assert "ALTER TABLE" in sql
+    assert sql.count("COMMENT ON COLUMN") == 2
+    assert sql.index("ALTER TABLE") < sql.index("COMMENT ON COLUMN")
 
 
 async def test_sync_table_comment_changed() -> None:
@@ -1157,11 +1196,11 @@ async def test_sync_table_comment_changed() -> None:
 
     await CommentModel.sync_table(session.dialect)
 
-    comment_sqls = [s for s in dialect.executed_sqls if "COMMENT ON COLUMN" in s]
-    # name: old → new, email: None → "Email address"
-    assert len(comment_sqls) == 2
-    assert any("User display name" in s for s in comment_sqls)
-    assert any("Email address" in s for s in comment_sqls)
+    assert len(dialect.executed_sqls) == 1
+    sql = dialect.executed_sqls[0]
+    assert sql.count("COMMENT ON COLUMN") == 2
+    assert "User display name" in sql
+    assert "Email address" in sql
 
 
 async def test_sync_table_noop_when_comments_match() -> None:
@@ -1184,9 +1223,62 @@ async def test_sync_table_noop_when_comments_match() -> None:
     assert len(dialect.executed_sqls) == 0
 
 
-# ---------------------------------------------------------------------------
-# MySQL 风格内联 COMMENT 测试
-# ---------------------------------------------------------------------------
+class _UnitMySQLDialect(MySQLDialect):
+    """无需真实连接池，只测试 MySQL DDL 构建逻辑。"""
+
+    def __init__(self) -> None:
+        pass
+
+
+@pytest.fixture
+def unit_mysql_dialect() -> _UnitMySQLDialect:
+    return _UnitMySQLDialect()
+
+
+async def test_mysql_schema_sync_combines_columns_and_indexes(
+    unit_mysql_dialect: _UnitMySQLDialect,
+) -> None:
+    """MySQL 应把列新增、列修改和全部索引合并为一条 ALTER TABLE。"""
+    existing = IntrospectedColumn("name", "varchar(50)", is_nullable=False)
+
+    sql = unit_mysql_dialect.build_schema_sync(
+        IndexedModel,
+        table_exists=True,
+        add_fields=["age", "email", "status"],
+        modify_pairs=[("name", existing)],
+        existing_index_names=set(),
+        pre_statements=[],
+        post_statements=[],
+    )
+
+    assert sql.count("ALTER TABLE") == 1
+    assert "ADD COLUMN `age`" in sql
+    assert "MODIFY COLUMN `name`" in sql
+    assert "ADD INDEX `ix_indexed_name_age`" in sql
+    assert "ADD UNIQUE INDEX `unq_indexed_email`" in sql
+    assert "ADD INDEX `idx_custom`" in sql
+    assert ";" not in sql
+
+
+async def test_mysql_schema_sync_puts_indexes_in_create_table(
+    unit_mysql_dialect: _UnitMySQLDialect,
+) -> None:
+    """MySQL 首次建表应把索引直接写入 CREATE TABLE。"""
+    sql = unit_mysql_dialect.build_schema_sync(
+        IndexedModel,
+        table_exists=False,
+        add_fields=[],
+        modify_pairs=[],
+        existing_index_names=set(),
+        pre_statements=[],
+        post_statements=[],
+    )
+
+    assert sql.count("CREATE TABLE") == 1
+    assert "INDEX `ix_indexed_name_age`" in sql
+    assert "UNIQUE INDEX `unq_indexed_email`" in sql
+    assert "INDEX `idx_custom`" in sql
+    assert sql.rstrip().endswith(")")
 
 
 class MySQLTestDialect(AbstractDialect):
@@ -1830,10 +1922,9 @@ async def test_sync_table_creates_with_enum_type():
 
     await _SyncEnumModel.sync_table(session.dialect)
 
-    # 验证 pre_create 在 create_table 之前执行
-    assert len(dialect.executed_sqls) == 2
-    assert "CREATE TYPE" in dialect.executed_sqls[0]
-    assert "CREATE TABLE" in dialect.executed_sqls[1]
+    assert len(dialect.executed_sqls) == 1
+    sql = dialect.executed_sqls[0]
+    assert sql.index("CREATE TYPE") < sql.index("CREATE TABLE")
 
 
 async def test_sync_table_skips_existing_enum_type():
@@ -1865,5 +1956,8 @@ async def test_sync_table_adds_new_enum_value_without_column_change():
 
     await _SyncEnumModel.sync_table(session.dialect)
 
-    alter_type_sqls = [s for s in dialect.executed_sqls if "ALTER TYPE" in s]
-    assert len(alter_type_sqls) == 2  # published + archived
+    assert len(dialect.executed_sqls) == 1
+    sql = dialect.executed_sqls[0]
+    assert sql.count("ALTER TYPE") == 2
+    assert "archived" in sql
+    assert "published" in sql

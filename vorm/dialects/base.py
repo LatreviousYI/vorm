@@ -141,6 +141,47 @@ class AbstractDialect(ABC):
             return False
 
     # ------------------------------------------------------------------
+    # DDL 批处理
+    # ------------------------------------------------------------------
+
+    def build_ddl_batch(self, statements: list[str]) -> str:
+        """将一张表同步产生的无参数 DDL 合并为一次执行文本。
+
+        DDL 语句本身不携带用户参数，因此可以按方言用分号串联。具体方言可
+        覆盖此方法，或覆盖 ``build_schema_sync``，把更多操作合并为单条命令。
+        """
+        non_empty = [statement.strip().rstrip(";") for statement in statements if statement.strip()]
+        return ";\n".join(non_empty)
+
+    def build_schema_sync(
+        self,
+        model: type[Model],
+        *,
+        table_exists: bool,
+        add_fields: list[str],
+        modify_pairs: list[tuple[str, IntrospectedColumn]],
+        existing_index_names: set[str],
+        pre_statements: list[str],
+        post_statements: list[str],
+    ) -> str:
+        """构建一张表本次同步所需的完整 DDL 批次。
+
+        默认实现保留各类 DDL 的依赖顺序：准备类型 → 建表/改列 → 索引 →
+        后置操作。返回值只包含 DDL，调用方应以空参数调用一次 ``execute``。
+        """
+        statements = list(pre_statements)
+        if table_exists:
+            alter_sql = self.build_sync_alter(model, add_fields, modify_pairs)
+            if alter_sql:
+                statements.append(alter_sql)
+        else:
+            statements.append(self.build_create_table(model))
+
+        statements.extend(self.build_sync_indexes(model, existing_index_names))
+        statements.extend(post_statements)
+        return self.build_ddl_batch(statements)
+
+    # ------------------------------------------------------------------
     # SQL 生成
     # ------------------------------------------------------------------
 
