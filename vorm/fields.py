@@ -67,6 +67,9 @@ def Field(
     if default is PydanticUndefined and primary_key and auto_increment:
         default = None
 
+    if timestamp_behavior not in (None, "create", "update", "both"):
+        raise ValueError("timestamp_behavior must be one of None, 'create', 'update', or 'both'")
+
     column_info = ColumnInfo(
         primary_key=primary_key,
         auto_increment=auto_increment,

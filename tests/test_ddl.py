@@ -1235,6 +1235,243 @@ def unit_mysql_dialect() -> _UnitMySQLDialect:
     return _UnitMySQLDialect()
 
 
+class TimestampDDLModel(Model):
+    """数据库托管时间戳的 DDL 测试模型。"""
+
+    class Meta:
+        table = "timestamp_ddl"
+
+    id: int = Field(primary_key=True, auto_increment=True)
+    created_at: datetime.datetime = Field(
+        default_factory=datetime.datetime.now,
+        timestamp_behavior="create",
+    )
+    updated_at: datetime.datetime = Field(
+        default_factory=datetime.datetime.now,
+        timestamp_behavior="both",
+    )
+
+
+class TimestampCreateOnlyModel(Model):
+    class Meta:
+        table = "timestamp_ddl"
+
+    id: int = Field(primary_key=True, auto_increment=True)
+    created_at: datetime.datetime = Field(
+        default_factory=datetime.datetime.now,
+        timestamp_behavior="create",
+    )
+    updated_at: datetime.datetime = Field(
+        default_factory=datetime.datetime.now,
+        timestamp_behavior="create",
+    )
+
+
+def test_invalid_timestamp_behavior_rejected() -> None:
+    """Field 应在模型定义前拒绝未知的 timestamp 行为。"""
+    with pytest.raises(ValueError, match="timestamp_behavior"):
+        Field(timestamp_behavior="sometimes")
+
+
+def test_timestamp_behavior_requires_datetime(dialect: DDLDialect) -> None:
+    """时间戳行为不能静默用于非日期时间类型。"""
+
+    class InvalidTimestampModel(Model):
+        value: str = Field(timestamp_behavior="create")
+
+    with pytest.raises(TypeError, match="timestamp_behavior"):
+        dialect.build_create_table(InvalidTimestampModel)
+
+
+def test_mysql_build_timestamp_defaults_and_update() -> None:
+    """MySQL 时间戳字段应生成 DEFAULT 和 ON UPDATE。"""
+    dialect = _UnitMySQLDialect()
+    sql = dialect.build_create_table(TimestampDDLModel)
+
+    assert "`created_at` DATETIME DEFAULT CURRENT_TIMESTAMP" in sql
+    assert "`created_at` DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE" not in sql
+    assert "`updated_at` DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP" in sql
+
+
+def test_mysql_modify_timestamp_adds_on_update() -> None:
+    """已有 MySQL 时间戳列缺少自动更新时间时应生成 MODIFY。"""
+    dialect = _UnitMySQLDialect()
+    existing = IntrospectedColumn(
+        "updated_at",
+        "datetime",
+        is_nullable=True,
+        column_default="CURRENT_TIMESTAMP",
+        extra="",
+    )
+
+    sql = dialect.build_modify_columns(TimestampDDLModel, [("updated_at", existing)])
+
+    assert "MODIFY COLUMN `updated_at` DATETIME" in sql
+    assert "ON UPDATE CURRENT_TIMESTAMP" in sql
+
+
+def test_mysql_timestamp_extra_is_detected() -> None:
+    """MySQL EXTRA 中的 ON UPDATE 标记应可被识别。"""
+    existing = IntrospectedColumn(
+        "updated_at",
+        "datetime",
+        is_nullable=True,
+        column_default="CURRENT_TIMESTAMP",
+        extra="DEFAULT_GENERATED on update CURRENT_TIMESTAMP",
+    )
+
+    assert existing.has_on_update_current_timestamp is True
+
+
+def test_mysql_timestamp_precision_is_preserved() -> None:
+    """MySQL DATETIME 精度应同时用于 DEFAULT 和 ON UPDATE 表达式。"""
+
+    class PreciseTimestampModel(Model):
+        updated_at: datetime.datetime = Field(
+            db_type="DATETIME(6)",
+            timestamp_behavior="both",
+        )
+
+    sql = _UnitMySQLDialect().build_create_table(PreciseTimestampModel)
+
+    assert "DEFAULT CURRENT_TIMESTAMP(6)" in sql
+    assert "ON UPDATE CURRENT_TIMESTAMP(6)" in sql
+
+
+def test_mysql_timestamp_column_matching_is_noop() -> None:
+    """MySQL 默认值和 ON UPDATE 均匹配时不应误报列变化。"""
+    dialect = _UnitMySQLDialect()
+    existing = IntrospectedColumn(
+        "updated_at",
+        "datetime",
+        is_nullable=True,
+        column_default="current_timestamp()",
+        extra="DEFAULT_GENERATED on update CURRENT_TIMESTAMP",
+    )
+
+    assert dialect.column_changed(TimestampDDLModel, "updated_at", existing) is False
+
+
+def test_postgresql_timestamp_default_variants_are_equivalent() -> None:
+    """PG 的 now() 与 CURRENT_TIMESTAMP 应视为相同数据库默认值。"""
+    from vorm.dialects.postgresql import PostgreSQLDialect
+
+    dialect = PostgreSQLDialect(pool=None)  # type: ignore[arg-type]
+    existing = IntrospectedColumn(
+        "created_at",
+        "timestamp without time zone",
+        is_nullable=True,
+        column_default="now()",
+    )
+
+    assert dialect.column_changed(TimestampDDLModel, "created_at", existing) is False
+
+
+def test_timestamp_trigger_names_fit_postgresql_identifier_limit() -> None:
+    """长表名/列名生成的 trigger 名必须稳定且不超过 PG 的 63 字节限制。"""
+    from vorm.ddl import timestamp_function_name, timestamp_trigger_name
+
+    table = "table_" + "x" * 80
+    first = timestamp_trigger_name(table, "updated_at")
+    second = timestamp_trigger_name(table, "changed_at")
+    function = timestamp_function_name(table, "updated_at")
+
+    assert len(first.encode()) <= 63
+    assert len(function.encode()) <= 63
+    assert first == timestamp_trigger_name(table, "updated_at")
+    assert first != second
+
+
+def test_postgresql_timestamp_trigger_ddl() -> None:
+    """PG update/both 时间戳应生成确定命名的触发器。"""
+    from vorm.dialects.postgresql import PostgreSQLDialect
+
+    dialect = PostgreSQLDialect(pool=None)  # type: ignore[arg-type]
+    sqls = dialect.build_timestamp_ddl(
+        TimestampDDLModel,
+        table_exists=False,
+        existing_trigger_names=set(),
+    )
+    sql = "\n".join(sqls)
+
+    assert "DEFAULT CURRENT_TIMESTAMP" in dialect.build_create_table(TimestampDDLModel)
+    assert 'CREATE OR REPLACE FUNCTION "vorm_ts_timestamp_ddl_updated_at_fn"()' in sql
+    assert 'CREATE TRIGGER "vorm_ts_timestamp_ddl_updated_at_update"' in sql
+    assert 'NEW."updated_at" = CURRENT_TIMESTAMP' in sql
+
+
+async def test_postgresql_existing_trigger_still_repairs_missing_default() -> None:
+    """PG trigger 已存在时，缺失的列默认值仍应通过 ALTER 修复。"""
+    from vorm.dialects.postgresql import PostgreSQLDialect
+
+    class RecordingPostgreSQLDialect(PostgreSQLDialect):
+        def __init__(self) -> None:
+            pass
+
+        async def introspect_columns(self, table_name: str) -> dict[str, IntrospectedColumn]:
+            return {
+                "id": IntrospectedColumn("id", "integer", is_nullable=False),
+                "created_at": IntrospectedColumn(
+                    "created_at", "timestamp without time zone", is_nullable=True
+                ),
+                "updated_at": IntrospectedColumn(
+                    "updated_at", "timestamp without time zone", is_nullable=True
+                ),
+            }
+
+        async def introspect_enum_types(self) -> dict[str, set[str]]:
+            return {}
+
+        async def introspect_indexes(self, table_name: str) -> set[str]:
+            return set()
+
+        async def introspect_timestamp_triggers(self, table_name: str) -> set[str]:
+            return {"vorm_ts_timestamp_ddl_updated_at_update"}
+
+        async def execute(self, sql: str, params: list[Any]) -> Any:
+            self.last_sql = sql
+            return None
+
+    dialect = RecordingPostgreSQLDialect()
+
+    await TimestampDDLModel.sync_table(dialect)
+
+    assert "SET DEFAULT CURRENT_TIMESTAMP" in dialect.last_sql
+    assert "CREATE TRIGGER" not in dialect.last_sql
+
+
+def test_postgresql_timestamp_trigger_sync_is_idempotent() -> None:
+    """已有确定命名的 PG trigger 不应重复生成 DDL。"""
+    from vorm.dialects.postgresql import PostgreSQLDialect
+
+    dialect = PostgreSQLDialect(pool=None)  # type: ignore[arg-type]
+    trigger_name = "vorm_ts_timestamp_ddl_updated_at_update"
+    sqls = dialect.build_timestamp_ddl(
+        TimestampDDLModel,
+        table_exists=True,
+        existing_trigger_names={trigger_name},
+    )
+
+    assert sqls == []
+
+
+def test_postgresql_timestamp_trigger_is_removed_when_behavior_changes() -> None:
+    """切换为 create 时只删除 VORM 自己管理的 trigger。"""
+    from vorm.dialects.postgresql import PostgreSQLDialect
+
+    dialect = PostgreSQLDialect(pool=None)  # type: ignore[arg-type]
+    trigger_name = "vorm_ts_timestamp_ddl_updated_at_update"
+    sqls = dialect.build_timestamp_ddl(
+        TimestampCreateOnlyModel,
+        table_exists=True,
+        existing_trigger_names={trigger_name},
+    )
+
+    assert len(sqls) == 1
+    assert "DROP TRIGGER IF EXISTS" in sqls[0]
+    assert trigger_name in sqls[0]
+
+
 async def test_mysql_schema_sync_combines_columns_and_indexes(
     unit_mysql_dialect: _UnitMySQLDialect,
 ) -> None:

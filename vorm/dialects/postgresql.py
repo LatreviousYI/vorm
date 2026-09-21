@@ -9,7 +9,14 @@ from typing import TYPE_CHECKING, Any
 
 import asyncpg
 
-from vorm.ddl import IntrospectedColumn, get_enum_values, is_enum_type, resolve_base_type
+from vorm.ddl import (
+    IntrospectedColumn,
+    get_enum_values,
+    is_enum_type,
+    resolve_base_type,
+    timestamp_function_name,
+    timestamp_trigger_name,
+)
 from vorm.dialects.base import AbstractDialect
 from vorm.fields import ColumnInfo
 
@@ -186,6 +193,13 @@ class PostgreSQLDialect(AbstractDialect):
         t = t.replace("timestamp without time zone", "timestamp")
         t = t.replace("timestamp with time zone", "timestamptz")
         return t
+
+    def _normalize_column_default(self, raw: str | None) -> str:
+        """Normalize equivalent PostgreSQL current-time default expressions."""
+        normalized = super()._normalize_column_default(raw).strip().lower()
+        if normalized in ("now()", "current_timestamp", "current_timestamp()"):
+            return "CURRENT_TIMESTAMP"
+        return normalized
 
     def _alter_column_type(self, sql_type: str) -> str:
         """SERIAL/BIGSERIAL 不是真实的 PG 类型，ALTER 时转为底层类型。"""
@@ -377,6 +391,57 @@ class PostgreSQLDialect(AbstractDialect):
                     result.append(f"ALTER TYPE {quoted} ADD VALUE '{val}'")
 
         return result
+
+    async def introspect_timestamp_triggers(self, table_name: str) -> set[str]:
+        """Return enabled user trigger names for a table in the current schema."""
+        query = (
+            "SELECT t.tgname AS trigger_name "
+            "FROM pg_catalog.pg_trigger t "
+            "JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid "
+            "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE c.relname = $1 AND n.nspname = current_schema() "
+            "AND NOT t.tgisinternal"
+        )
+        rows = await self.fetch(query, [table_name])
+        return {row["trigger_name"] for row in rows}
+
+    def build_timestamp_ddl(
+        self,
+        model: type[Model],
+        *,
+        table_exists: bool,
+        existing_trigger_names: set[str],
+    ) -> list[str]:
+        """Create or remove deterministic triggers for database-managed update times."""
+        statements: list[str] = []
+        table = self.quote_identifier(model.__table__)
+
+        for field_name, info in model.__column_info__.items():
+            column = model.__columns__[field_name]
+            trigger_name = timestamp_trigger_name(model.__table__, column.column_name)
+            function_name = timestamp_function_name(model.__table__, column.column_name)
+            trigger = self.quote_identifier(trigger_name)
+            function = self.quote_identifier(function_name)
+            column_name = self.quote_identifier(column.column_name)
+            requires_update = info.timestamp_behavior in ("update", "both")
+
+            if requires_update:
+                if table_exists and trigger_name in existing_trigger_names:
+                    continue
+                statements.append(
+                    f"CREATE OR REPLACE FUNCTION {function}() RETURNS TRIGGER AS $$ "
+                    f"BEGIN NEW.{column_name} = CURRENT_TIMESTAMP; RETURN NEW; END; "
+                    "$$ LANGUAGE plpgsql"
+                )
+                statements.append(f"DROP TRIGGER IF EXISTS {trigger} ON {table}")
+                statements.append(
+                    f"CREATE TRIGGER {trigger} BEFORE UPDATE ON {table} "
+                    f"FOR EACH ROW EXECUTE FUNCTION {function}()"
+                )
+            elif trigger_name in existing_trigger_names:
+                statements.append(f"DROP TRIGGER IF EXISTS {trigger} ON {table}")
+
+        return statements
 
     def build_post_create(self, model: type[Model]) -> list[str]:
         """Generate COMMENT ON COLUMN for all columns that have a comment."""

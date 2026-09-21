@@ -168,6 +168,15 @@ class Model(BaseModel, metaclass=ModelMeta):
                 dialect.build_post_alter(model_cls, modified, add_fields=missing)
             )
 
+        existing_triggers = await dialect.introspect_timestamp_triggers(cls.__table__)
+        post_statements.extend(
+            dialect.build_timestamp_ddl(
+                model_cls,
+                table_exists=table_exists,
+                existing_trigger_names=existing_triggers,
+            )
+        )
+
         existing_indexes = await dialect.introspect_indexes(cls.__table__)
         sql = dialect.build_schema_sync(
             model_cls,
