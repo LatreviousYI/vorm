@@ -17,9 +17,9 @@ jobs:
       version-changed: ${{ steps.version-check.outputs.version-changed }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5          # v4 → v5 (Node.js 24)
         with:
-          fetch-depth: 2  # 需要 HEAD~1 用于版本比较
+          fetch-depth: 2
 
       - name: Check if version changed
         id: version-check
@@ -41,13 +41,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5          # v4 → v5 (Node.js 24)
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v7         # v5 → v7 (Node.js 24)
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6       # v5 → v6 (Node.js 24)
         with:
           python-version-file: pyproject.toml
 
@@ -55,7 +55,7 @@ jobs:
         run: uv build
 
       - name: Upload dist artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6    # v4 → v6 (Node.js 24)
         with:
           name: dist
           path: dist/
@@ -67,13 +67,13 @@ jobs:
     environment: release
     steps:
       - name: Download dist artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7  # v4 → v7 (Node.js 24)
         with:
           name: dist
           path: dist/
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v7         # v5 → v7 (Node.js 24)
 
       - name: Publish to PyPI
         run: uv publish --trusted-publishing always
