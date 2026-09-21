@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import datetime as _dt
 import enum
 import json as _json_mod
 import re
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any
 
-from vorm.fields import ColumnInfo
+from vorm.fields import ColumnInfo, get_column_info
 
 if TYPE_CHECKING:
     from vorm.ddl import IntrospectedColumn
@@ -141,6 +140,47 @@ class AbstractDialect(ABC):
             return False
 
     # ------------------------------------------------------------------
+    # DDL 批处理
+    # ------------------------------------------------------------------
+
+    def build_ddl_batch(self, statements: list[str]) -> str:
+        """将一张表同步产生的无参数 DDL 合并为一次执行文本。
+
+        DDL 语句本身不携带用户参数，因此可以按方言用分号串联。具体方言可
+        覆盖此方法，或覆盖 ``build_schema_sync``，把更多操作合并为单条命令。
+        """
+        non_empty = [statement.strip().rstrip(";") for statement in statements if statement.strip()]
+        return ";\n".join(non_empty)
+
+    def build_schema_sync(
+        self,
+        model: type[Model],
+        *,
+        table_exists: bool,
+        add_fields: list[str],
+        modify_pairs: list[tuple[str, IntrospectedColumn]],
+        existing_index_names: set[str],
+        pre_statements: list[str],
+        post_statements: list[str],
+    ) -> str:
+        """构建一张表本次同步所需的完整 DDL 批次。
+
+        默认实现保留各类 DDL 的依赖顺序：准备类型 → 建表/改列 → 索引 →
+        后置操作。返回值只包含 DDL，调用方应以空参数调用一次 ``execute``。
+        """
+        statements = list(pre_statements)
+        if table_exists:
+            alter_sql = self.build_sync_alter(model, add_fields, modify_pairs)
+            if alter_sql:
+                statements.append(alter_sql)
+        else:
+            statements.append(self.build_create_table(model))
+
+        statements.extend(self.build_sync_indexes(model, existing_index_names))
+        statements.extend(post_statements)
+        return self.build_ddl_batch(statements)
+
+    # ------------------------------------------------------------------
     # SQL 生成
     # ------------------------------------------------------------------
 
@@ -256,18 +296,11 @@ class AbstractDialect(ABC):
                 continue
 
             info = model_column_info[field_name]
-            # "create" 行为的时间戳字段在 UPDATE 时跳过，保留原值
-            if info.timestamp_behavior == "create":
+            # 时间戳字段由数据库完全管理，ORM 不在 UPDATE 中写入其值。
+            if info.timestamp_behavior is not None:
                 continue
-            # "both" / "update" 行为在 UPDATE 时重新计算
-            if info.timestamp_behavior in ("both", "update"):
-                factory = model.model_fields[field_name].default_factory
-                if factory is not None:
-                    value = factory()
-                else:
-                    value = _dt.datetime.now()
-            else:
-                value = getattr(instance, field_name)
+
+            value = getattr(instance, field_name)
 
             if isinstance(value, dict | list):
                 value = _json_mod.dumps(value)
@@ -290,28 +323,29 @@ class AbstractDialect(ABC):
     ) -> tuple[str, list[Any]]:
         """生成 UPDATE ... SET ... WHERE ... 语句（按条件批量更新）。
 
-        自动为 ``timestamp_behavior`` 为 ``"both"`` 或 ``"update"`` 的字段注入当前时间，
-        除非用户已在 ``values`` 中显式传入。
+        时间戳字段由数据库默认值或触发器管理；传入 values 中的时间戳字段
+        也会被忽略，避免 ORM 覆盖数据库生成的值。
         """
         params: list[Any] = []
         model = query.model
         table = self.quote_identifier(model.__table__)
 
-        # 自动注入时间戳字段（"both" / "update"），用户显式值优先
-        all_values = dict(values)
-        for field_name, info in model.__column_info__.items():
-            if info.timestamp_behavior in ("both", "update") and field_name not in all_values:
-                factory = model.model_fields[field_name].default_factory
-                all_values[field_name] = factory() if factory is not None else _dt.datetime.now()
-
         assignments: list[str] = []
         model_columns = model.__columns__
-        for field_name, value in all_values.items():
+        for field_name, value in values.items():
+            info = model.__column_info__.get(field_name)
+            if info is None:
+                raise KeyError(f"Unknown field: {field_name}")
+            if info.timestamp_behavior is not None:
+                continue
             col = self.quote_identifier(model_columns[field_name].column_name)
             if isinstance(value, dict | list):
                 value = _json_mod.dumps(value)
             params.append(value)
             assignments.append(f"{col} = {self.render_placeholder(len(params))}")
+
+        if not assignments:
+            raise ValueError("No writable fields supplied")
         sql = f"UPDATE {table} SET {', '.join(assignments)}"
         if query.filters:
             where = " AND ".join(expr.render(self, params) for expr in query.filters)
@@ -404,6 +438,13 @@ class AbstractDialect(ABC):
         各方言可覆盖以适配不同语法（MySQL JSON 需要括号包裹等）。
         """
         from pydantic_core import PydanticUndefined
+
+        info = get_column_info(field_info)
+        if info is not None and info.timestamp_behavior is not None:
+            normalized_type = sql_type.upper()
+            if "TIMESTAMP" not in normalized_type and "DATETIME" not in normalized_type:
+                raise TypeError("timestamp_behavior requires a DATETIME or TIMESTAMP column")
+            return "DEFAULT CURRENT_TIMESTAMP"
 
         default = field_info.default
         if default is PydanticUndefined and field_info.default_factory is not None:
@@ -573,6 +614,25 @@ class AbstractDialect(ABC):
         ``COMMENT ON COLUMN`` statements.
         """
         return []
+
+    def build_timestamp_ddl(
+        self,
+        model: type[Model],
+        *,
+        table_exists: bool,
+        existing_trigger_names: set[str],
+    ) -> list[str]:
+        """Return DDL for database-managed timestamp update behavior.
+
+        MySQL expresses this behavior in the column definition, while
+        PostgreSQL overrides this hook to maintain triggers.  The returned
+        statements run after table/column DDL has completed.
+        """
+        return []
+
+    async def introspect_timestamp_triggers(self, table_name: str) -> set[str]:
+        """Return names of database triggers relevant to timestamp syncing."""
+        return set()
 
     def build_add_column(self, model: type[Model], field_name: str) -> str:
         """生成 ``ALTER TABLE ... ADD COLUMN ...`` 语句（单列）。"""
@@ -793,6 +853,9 @@ class AbstractDialect(ABC):
         model_column_info = model.__column_info__
         for field_name in model.__columns__:
             info = model_column_info[field_name]
+            # 时间戳字段由数据库默认值或触发器完全管理，ORM 不绑定其值。
+            if info.timestamp_behavior is not None:
+                continue
             value = getattr(instance, field_name)
             if info.primary_key and info.auto_increment and value is None:
                 continue

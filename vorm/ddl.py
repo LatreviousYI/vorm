@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import enum
+import hashlib
 import typing
 from dataclasses import dataclass
 from typing import Any
@@ -33,6 +34,31 @@ class IntrospectedColumn:
     column_default: str | None = None
     column_comment: str | None = None
     is_auto_increment: bool = False
+    extra: str | None = None
+
+    @property
+    def has_on_update_current_timestamp(self) -> bool:
+        """Return whether introspection reported automatic timestamp updates."""
+        return "on update current_timestamp" in (self.extra or "").lower()
+
+
+def _postgresql_identifier(name: str) -> str:
+    """Keep generated identifiers deterministic and within PG's 63-byte limit."""
+    if len(name.encode()) <= 63:
+        return name
+    digest = hashlib.sha256(name.encode()).hexdigest()[:12]
+    prefix = name.encode()[: 63 - len(digest) - 1].decode(errors="ignore")
+    return f"{prefix}_{digest}"
+
+
+def timestamp_trigger_name(table_name: str, column_name: str) -> str:
+    """Return a deterministic name for a VORM-managed update trigger."""
+    return _postgresql_identifier(f"vorm_ts_{table_name}_{column_name}_update")
+
+
+def timestamp_function_name(table_name: str, column_name: str) -> str:
+    """Return a deterministic name for a VORM-managed trigger function."""
+    return _postgresql_identifier(f"vorm_ts_{table_name}_{column_name}_fn")
 
 
 def resolve_base_type(annotation: Any) -> type:

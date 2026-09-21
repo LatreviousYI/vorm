@@ -10,7 +10,7 @@ import asyncmy
 
 from vorm.ddl import IntrospectedColumn, get_enum_values, resolve_base_type
 from vorm.dialects.base import AbstractDialect
-from vorm.fields import ColumnInfo
+from vorm.fields import ColumnInfo, get_column_info
 
 logger = logging.getLogger("vorm")
 
@@ -152,6 +152,24 @@ class MySQLDialect(AbstractDialect):
             s = s[1:-1].strip()
         return s.lower()
 
+    @staticmethod
+    def _normalize_current_timestamp(value: str) -> str:
+        """Normalize MySQL CURRENT_TIMESTAMP precision and parenthesis variants."""
+        import re
+
+        return re.sub(r"current_timestamp(?:\(\d*\))?", "current_timestamp", value.lower())
+
+    @staticmethod
+    def _timestamp_precision(sql_type: str) -> str:
+        """Return a precision suffix such as ``(6)`` from DATETIME/TIMESTAMP."""
+        import re
+
+        match = re.search(r"(?:datetime|timestamp)\s*(\(\d+\))", sql_type, re.IGNORECASE)
+        return match.group(1) if match else ""
+
+    def _timestamp_expression(self, sql_type: str) -> str:
+        return f"CURRENT_TIMESTAMP{self._timestamp_precision(sql_type)}"
+
     def _default_changed(
         self,
         model: Any,
@@ -176,15 +194,18 @@ class MySQLDialect(AbstractDialect):
 
         db_normalized = self._normalize_column_default(existing.column_default)
 
+        if info.timestamp_behavior is not None:
+            expected_normalized = self._normalize_current_timestamp(expected_normalized)
+            db_normalized = self._normalize_current_timestamp(db_normalized)
+
         # 双方都空 → 无变化
         if not expected_normalized and not db_normalized:
             return False
 
-        # 模型有表达式默认值，但 MySQL 不把表达式存入 COLUMN_DEFAULT（返回 NULL）
-        # 比如 DEFAULT (JSON_OBJECT()) → MySQL COLUMN_DEFAULT = NULL
-        # 此时无法比对，视为未变化
+        # MySQL 无法内省某些 JSON 表达式默认值，因此只对非时间戳字段保留
+        # 旧的宽松行为。时间戳必须有数据库默认值，缺失时需要修复。
         if expected_normalized and not db_normalized:
-            return False
+            return info.timestamp_behavior is not None
 
         # 模型无默认值，但 DB 有 → 视为变化（模型中移除了默认值）
         if not expected_normalized and db_normalized:
@@ -227,7 +248,13 @@ class MySQLDialect(AbstractDialect):
         null_changed = info.nullable != existing.is_nullable
         default_changed = self._default_changed(model, field_name, existing)
         comment_changed = self._comment_changed(model, field_name, existing)
-        return type_changed or null_changed or default_changed or comment_changed
+        timestamp_changed = False
+        if info.timestamp_behavior is not None:
+            expected_on_update = info.timestamp_behavior in ("update", "both")
+            timestamp_changed = expected_on_update != existing.has_on_update_current_timestamp
+        return (
+            type_changed or null_changed or default_changed or comment_changed or timestamp_changed
+        )
 
     def map_python_type(self, annotation: Any, column_info: ColumnInfo) -> str:
         if column_info.db_type is not None:
@@ -278,8 +305,11 @@ class MySQLDialect(AbstractDialect):
         column: Any,
         info: ColumnInfo,
     ) -> str:
-        """MySQL 风格：列定义末尾追加 ``COMMENT 'text'``（当 info.comment 非空时）。"""
+        """MySQL 风格：追加自动更新时间与列注释。"""
         base_def = super()._build_column_def(model, field_name, column, info)
+        if info.timestamp_behavior in ("update", "both"):
+            sql_type = self.map_python_type(model.model_fields[field_name].annotation, info)
+            base_def += f" ON UPDATE {self._timestamp_expression(sql_type)}"
         if info.comment:
             escaped = info.comment.replace("'", "''")
             base_def += f" COMMENT '{escaped}'"
@@ -297,13 +327,15 @@ class MySQLDialect(AbstractDialect):
         result: dict[str, IntrospectedColumn] = {}
         for row in rows:
             raw_comment = row.get("COLUMN_COMMENT")
+            extra = row.get("EXTRA") or ""
             col = IntrospectedColumn(
                 column_name=row["COLUMN_NAME"],
                 data_type=row["COLUMN_TYPE"],
                 is_nullable=row["IS_NULLABLE"] == "YES",
                 column_default=row.get("COLUMN_DEFAULT"),
                 column_comment=raw_comment if raw_comment else None,
-                is_auto_increment=(row.get("EXTRA") or "").lower() == "auto_increment",
+                is_auto_increment="auto_increment" in extra.lower(),
+                extra=extra,
             )
             result[col.column_name.lower()] = col
         return result
@@ -342,6 +374,10 @@ class MySQLDialect(AbstractDialect):
             null_changed = info.nullable != existing.is_nullable
             default_changed = self._default_changed(model, field_name, existing)
             comment_changed = self._comment_changed(model, field_name, existing)
+            timestamp_changed = False
+            if info.timestamp_behavior is not None:
+                expected_on_update = info.timestamp_behavior in ("update", "both")
+                timestamp_changed = expected_on_update != existing.has_on_update_current_timestamp
             auto_increment_changed = info.auto_increment != existing.is_auto_increment
 
             if (
@@ -349,6 +385,7 @@ class MySQLDialect(AbstractDialect):
                 and not null_changed
                 and not default_changed
                 and not comment_changed
+                and not timestamp_changed
                 and not auto_increment_changed
             ):
                 continue
@@ -395,6 +432,9 @@ class MySQLDialect(AbstractDialect):
             if default_clause:
                 parts.append(default_clause)
 
+        if info.timestamp_behavior in ("update", "both"):
+            parts.append(f"ON UPDATE {self._timestamp_expression(sql_type)}")
+
         # COMMENT 子句
         if info.comment:
             escaped = info.comment.replace("'", "''")
@@ -437,11 +477,17 @@ class MySQLDialect(AbstractDialect):
             default_changed = self._default_changed(model, field_name, existing)
             comment_changed = self._comment_changed(model, field_name, existing)
 
+            timestamp_changed = False
+            if info.timestamp_behavior is not None:
+                expected_on_update = info.timestamp_behavior in ("update", "both")
+                timestamp_changed = expected_on_update != existing.has_on_update_current_timestamp
+
             if (
                 not type_changed
                 and not null_changed
                 and not default_changed
                 and not comment_changed
+                and not timestamp_changed
             ):
                 continue
 
@@ -454,6 +500,61 @@ class MySQLDialect(AbstractDialect):
         sep = ",\n  "
         return f"ALTER TABLE {table}\n  {sep.join(clauses)}"
 
+    def build_schema_sync(
+        self,
+        model: type[Any],
+        *,
+        table_exists: bool,
+        add_fields: list[str],
+        modify_pairs: list[tuple[str, IntrospectedColumn]],
+        existing_index_names: set[str],
+        pre_statements: list[str],
+        post_statements: list[str],
+    ) -> str:
+        """将同一张表的列变更和索引变更合并为一条 MySQL ALTER TABLE。"""
+        statements = list(pre_statements)
+        table = self.quote_identifier(model.__table__)
+
+        index_clauses: list[str] = []
+        model_columns = model.__columns__
+        for idx in model.__indexes__:
+            name = idx.index_name(model.__table__)
+            if name in existing_index_names:
+                continue
+            columns = ", ".join(
+                self.quote_identifier(model_columns[field_name].column_name)
+                for field_name in idx.fields
+            )
+            unique = "UNIQUE " if idx.unique else ""
+            index_clauses.append(f"ADD {unique}INDEX {self.quote_identifier(name)} ({columns})")
+
+        if table_exists:
+            alter_sql = self.build_sync_alter(model, add_fields, modify_pairs)
+            alter_clauses: list[str] = []
+            if alter_sql:
+                _, _, clause_text = alter_sql.partition("\n")
+                alter_clauses.append(clause_text.strip())
+            alter_clauses.extend(index_clauses)
+            if alter_clauses:
+                statements.append(f"ALTER TABLE {table}\n  " + ",\n  ".join(alter_clauses))
+        else:
+            # MySQL 支持在 CREATE TABLE 中声明索引，首次建表也只需一条语句。
+            create_sql = self.build_create_table(model)
+            if index_clauses:
+                index_definitions = [clause.removeprefix("ADD ") for clause in index_clauses]
+                closing = "\n)"
+                if create_sql.endswith(closing):
+                    create_sql = (
+                        create_sql[: -len(closing)]
+                        + ",\n"
+                        + ",\n".join(f"  {definition}" for definition in index_definitions)
+                        + closing
+                    )
+            statements.append(create_sql)
+
+        statements.extend(post_statements)
+        return self.build_ddl_batch(statements)
+
     def _render_json_default_expr(self, value: Any) -> str:
         """MySQL 使用 ``JSON_OBJECT`` / ``JSON_ARRAY`` 原生函数。"""
         from vorm.dialects.base import _render_json_default_expr
@@ -461,8 +562,15 @@ class MySQLDialect(AbstractDialect):
         return _render_json_default_expr(value, "JSON_OBJECT", "JSON_ARRAY")
 
     def _render_default_clause(self, field_info: Any, sql_type: str) -> str:
-        """MySQL JSON 默认值使用原生函数 + 括号包裹：``DEFAULT (JSON_OBJECT())``。"""
+        """MySQL JSON 默认值使用原生函数；时间戳由数据库生成。"""
         from pydantic_core import PydanticUndefined
+
+        info = get_column_info(field_info)
+        if info is not None and info.timestamp_behavior is not None:
+            normalized_type = sql_type.upper()
+            if "DATETIME" not in normalized_type and "TIMESTAMP" not in normalized_type:
+                raise TypeError("timestamp_behavior requires a DATETIME or TIMESTAMP column")
+            return f"DEFAULT {self._timestamp_expression(sql_type)}"
 
         default = field_info.default
         if default is PydanticUndefined and field_info.default_factory is not None:

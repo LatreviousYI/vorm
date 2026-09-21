@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime
 from typing import Any
 
 import pytest
@@ -518,62 +519,74 @@ def test_json_path_multiple_filters(session: Session) -> None:
 
 
 class TimestampedModel(Model):
-    """测试 timestamp_behavior 的模型。"""
+    """测试数据库接管的 timestamp_behavior 模型。"""
 
     class Meta:
         table = "timestamped"
 
     id: int = Field(primary_key=True, auto_increment=True)
     title: str
-    created_at: str = Field(timestamp_behavior="create")
-    updated_at: str = Field(timestamp_behavior="both")
+    created_at: datetime.datetime = Field(timestamp_behavior="create")
+    updated_at: datetime.datetime = Field(timestamp_behavior="both")
 
 
 def test_build_update_skips_create_timestamp(session: Session) -> None:
-    """build_update 应跳过 timestamp_behavior='create' 的字段。"""
-    instance = TimestampedModel(id=1, title="test", created_at="old", updated_at="old")
+    """数据库接管时，build_update 应跳过所有 timestamp 字段。"""
+    instance = TimestampedModel(
+        id=1,
+        title="test",
+        created_at=datetime.datetime.now(),
+        updated_at=datetime.datetime.now(),
+    )
 
     sql, params = session.dialect.build_update(instance)
 
-    # created_at 不应出现在 SET 子句中
     assert "created_at" not in sql
-    # updated_at 应出现
-    assert "updated_at" in sql
+    assert "updated_at" not in sql
     assert "title" in sql
+    assert all(isinstance(value, str) for value in params[:-1])
 
 
 def test_build_update_recomputes_both_timestamp(session: Session) -> None:
-    """build_update 对 timestamp_behavior='both' 的字段应重新计算（不用实例旧值）。"""
-    instance = TimestampedModel(id=1, title="test", created_at="old", updated_at="old_ignored")
+    """数据库接管时，build_update 不应注入 ORM 当前时间。"""
+    instance = TimestampedModel(
+        id=1,
+        title="test",
+        created_at=datetime.datetime.now(),
+        updated_at=datetime.datetime.now(),
+    )
 
     sql, params = session.dialect.build_update(instance)
 
-    # updated_at 的新值不应是旧值 "old_ignored"
-    assert "old_ignored" not in params
+    assert "updated_at" not in sql
+    assert all(not isinstance(value, datetime.datetime) for value in params)
 
 
 def test_build_update_by_query_auto_injects_timestamp(session: Session) -> None:
-    """build_update_by_query 应自动为 'both' 字段注入当前时间戳。"""
+    """QuerySet UPDATE 应完全交给数据库生成时间戳。"""
     query = session.query(TimestampedModel).filter(TimestampedModel.title == "test")
 
     sql, params = session.dialect.build_update_by_query(query, {"title": "updated"})
 
-    # updated_at 应自动出现在 SET 子句中
-    assert "updated_at" in sql
-    # created_at（'create' 行为）不应自动出现
+    assert "updated_at" not in sql
     assert "created_at" not in sql
     assert "title" in sql
 
 
-def test_build_insert_includes_all_timestamps(session: Session) -> None:
-    """build_insert 应正常包含所有字段（timestamp_behavior 不影响 INSERT）。"""
-    instance = TimestampedModel(title="new", created_at="now", updated_at="now")
+def test_build_insert_omits_database_timestamps(session: Session) -> None:
+    """INSERT 不应绑定由数据库默认值生成的时间戳字段。"""
+    instance = TimestampedModel(
+        title="new",
+        created_at=datetime.datetime.now(),
+        updated_at=datetime.datetime.now(),
+    )
 
     sql, params = session.dialect.build_insert(instance)
 
-    assert "created_at" in sql
-    assert "updated_at" in sql
+    assert "created_at" not in sql
+    assert "updated_at" not in sql
     assert "title" in sql
+    assert params == ["new"]
 
 
 # ---------------------------------------------------------------------------

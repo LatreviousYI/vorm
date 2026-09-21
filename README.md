@@ -87,13 +87,13 @@ class AllFieldTypes(BaseField):
 
     created_at: datetime.datetime = Field(
         default_factory=datetime.datetime.now,
-        timestamp_behavior="create",  # INSERT 时写入，UPDATE 时跳过
+        timestamp_behavior="create",  # 数据库 INSERT 时生成，UPDATE 保留原值
     )
     # MySQL → DATETIME,  PG → TIMESTAMP
 
     updated_at: datetime.datetime = Field(
         default_factory=datetime.datetime.now,
-        timestamp_behavior="both",  # INSERT / UPDATE 都会刷新
+        timestamp_behavior="both",  # 数据库 INSERT 时生成，UPDATE 时自动刷新
         index=True
     )
 
@@ -146,11 +146,11 @@ class Article(Model):
     view_count: int = Field(default=0)
     created_at: datetime.datetime = Field(
         default_factory=datetime.datetime.now,
-        timestamp_behavior="create",           # INSERT 写入，UPDATE 保留原值
+        timestamp_behavior="create",           # 数据库 INSERT 时生成，UPDATE 保留原值
     )
     updated_at: datetime.datetime = Field(
         default_factory=datetime.datetime.now,
-        timestamp_behavior="both",             # INSERT + UPDATE 均刷新
+        timestamp_behavior="both",             # 数据库 INSERT 时生成，UPDATE 时自动刷新
     )
 ```
 
@@ -342,11 +342,20 @@ logging.basicConfig(
 
 ### timestamp_behavior
 
+带有 `timestamp_behavior` 的 `datetime.datetime` 字段由数据库完全接管：ORM 的
+INSERT、实例 UPDATE 和 QuerySet UPDATE 都不会绑定这些列，即使模型声明了
+`default_factory=datetime.datetime.now`。数据库写入后的值不会自动回填到当前实例；
+需要重新查询该记录来获取最终时间。
+
 | 值 | INSERT | UPDATE |
 |---|---|---|
-| `"create"` | 写入值 | 跳过，保留原值 |
-| `"update"` | 写入值 | 重新计算当前时间 |
-| `"both"` | 写入值 | 重新计算当前时间 |
+| `"create"` | 数据库 `CURRENT_TIMESTAMP` | 保留原值 |
+| `"update"` | 数据库 `CURRENT_TIMESTAMP` | 数据库自动刷新 |
+| `"both"` | 数据库 `CURRENT_TIMESTAMP` | 数据库自动刷新 |
+
+MySQL 使用 `DEFAULT CURRENT_TIMESTAMP` 和 `ON UPDATE CURRENT_TIMESTAMP`；
+PostgreSQL 使用 `DEFAULT CURRENT_TIMESTAMP` 和 VORM 管理的 `BEFORE UPDATE` trigger。
+`sync_table()` 会为新表和已有表同步这些数据库规则。
 
 ### Meta 配置
 
