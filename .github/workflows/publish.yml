@@ -16,23 +16,38 @@ jobs:
     outputs:
       version-changed: ${{ steps.version-check.outputs.version-changed }}
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v5          # v4 → v5 (Node.js 24)
-        with:
-          fetch-depth: 2
+      - uses: actions/checkout@v5
 
-      - name: Check if version changed
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version-file: pyproject.toml
+
+      - name: Check if version is newer than PyPI
         id: version-check
         run: |
-          CURRENT_VERSION=$(grep '^version = ' pyproject.toml | cut -d'"' -f2)
-          PREVIOUS_VERSION=$(git show HEAD~1:pyproject.toml | grep '^version = ' | cut -d'"' -f2)
-          if [ "$CURRENT_VERSION" != "$PREVIOUS_VERSION" ]; then
-            echo "Version changed: $PREVIOUS_VERSION → $CURRENT_VERSION"
-            echo "version-changed=true" >> $GITHUB_OUTPUT
-          else
-            echo "Version unchanged: $CURRENT_VERSION"
-            echo "version-changed=false" >> $GITHUB_OUTPUT
-          fi
+          uv run --with packaging python - <<'PY'
+          import tomllib, urllib.request, json, os, sys
+          from packaging.version import Version
+
+          with open("pyproject.toml", "rb") as f:
+              local = Version(tomllib.load(f)["project"]["version"])
+
+          pypi_name = tomllib.load(open("pyproject.toml", "rb"))["project"]["name"]
+          try:
+              with urllib.request.urlopen(f"https://pypi.org/pypi/{pypi_name}/json") as r:
+                  remote = Version(json.load(r)["info"]["version"])
+          except Exception:
+              remote = Version("0")
+
+          changed = local > remote
+          print(f"local={local}  pypi={remote}  will_publish={changed}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+              fh.write(f"version-changed={'true' if changed else 'false'}\n")
+          PY
 
   build:
     name: Build package
