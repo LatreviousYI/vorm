@@ -83,7 +83,7 @@ class Session:
         await self.dialect.begin()
         try:
             yield self
-        except Exception:
+        except BaseException:
             await self.dialect.rollback()
             raise
         else:
