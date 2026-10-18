@@ -248,20 +248,38 @@ async def test_count_returns_zero_when_fetchrow_is_none(
 
 async def test_exists_returns_true(session: Session, dialect: ConfigurableDialect) -> None:
     """query.exists() returns True when at least one row matches."""
-    dialect.fetchrow_result = {"count": 1}
+    dialect.fetchrow_result = {"?column?": 1}
 
     result = await session.query(User).filter(User.name == "Alice").exists()
 
     assert result is True
+    assert "SELECT 1" in dialect.last_sql
+    assert "LIMIT" in dialect.last_sql
+    assert "COUNT(*)" not in dialect.last_sql
 
 
 async def test_exists_returns_false(session: Session, dialect: ConfigurableDialect) -> None:
     """query.exists() returns False when no rows match."""
-    dialect.fetchrow_result = {"count": 0}
+    dialect.fetchrow_result = None
 
     result = await session.query(User).filter(User.name == "Nobody").exists()
 
     assert result is False
+
+
+async def test_exists_with_join_includes_join_and_filter(
+    session: Session, dialect: ConfigurableDialect
+) -> None:
+    dialect.fetchrow_result = {"?column?": 1}
+
+    result = await session.query(User).join(Post, on=User.id == Post.user_id).filter(
+        Post.title == "Hello"
+    ).exists()
+
+    assert result is True
+    assert 'INNER JOIN "posts"' in dialect.last_sql
+    assert "WHERE" in dialect.last_sql
+    assert "LIMIT" in dialect.last_sql
 
 
 # -- Chained query ---------------------------------------------------------

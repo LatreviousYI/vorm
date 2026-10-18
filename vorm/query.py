@@ -57,11 +57,15 @@ class QuerySet(Generic[ModelT]):
         return clone
 
     def limit(self, count: int) -> QuerySet[ModelT]:
+        if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+            raise ValueError("limit must be a non-negative integer")
         clone = self._clone()
         clone.limit_count = count
         return clone
 
     def offset(self, count: int) -> QuerySet[ModelT]:
+        if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+            raise ValueError("offset must be a non-negative integer")
         clone = self._clone()
         clone.offset_count = count
         return clone
@@ -73,8 +77,11 @@ class QuerySet(Generic[ModelT]):
         :param on: JOIN 条件表达式（如 ``User.id == Post.user_id``）
         :param type: JOIN 类型，``"INNER"``（默认）或 ``"LEFT"``
         """
+        join_type = type.upper() if isinstance(type, str) else ""
+        if join_type not in {"INNER", "LEFT"}:
+            raise ValueError("join type must be 'INNER' or 'LEFT'")
         clone = self._clone()
-        clone.joins.append(JoinInfo(model, on, type.upper()))
+        clone.joins.append(JoinInfo(model, on, join_type))
         return clone
 
     def select(self, *columns: Column | AliasedColumn) -> QuerySet[ModelT]:
@@ -146,7 +153,8 @@ class QuerySet(Generic[ModelT]):
         return int(row["count"]) if row is not None else 0
 
     async def exists(self) -> bool:
-        return await self.count() > 0
+        sql, params = self.session.dialect.build_select(self, exists=True)
+        return await self.session.dialect.fetchrow(sql, params) is not None
 
     async def update(self, **values: Any) -> int:
         """按条件批量更新，无需先查询。返回受影响行数。

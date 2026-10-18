@@ -11,11 +11,13 @@ from vorm.expression import Column
 from vorm.fields import ColumnInfo, get_column_info
 
 if TYPE_CHECKING:
+    from pydantic._internal._model_construction import ModelMetaclass
+
     from vorm.dialects.base import AbstractDialect
+else:
+    ModelMetaclass = type(BaseModel)
 
 logger = logging.getLogger("vorm")
-
-ModelMetaclass = type(BaseModel)
 
 
 class ModelMeta(ModelMetaclass):

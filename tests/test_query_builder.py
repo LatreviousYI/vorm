@@ -84,6 +84,18 @@ def test_build_select_with_filters_order_limit_offset(session: Session) -> None:
     assert params == [18, "Bob", 10, 20]
 
 
+@pytest.mark.parametrize("value", [-1, 1.5, True])
+def test_limit_rejects_invalid_values(session: Session, value: int | float) -> None:
+    with pytest.raises(ValueError, match="limit must be a non-negative integer"):
+        session.query(User).limit(value)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("value", [-1, 1.5, True])
+def test_offset_rejects_invalid_values(session: Session, value: int | float) -> None:
+    with pytest.raises(ValueError, match="offset must be a non-negative integer"):
+        session.query(User).offset(value)  # type: ignore[arg-type]
+
+
 def test_order_by_desc_col(session: Session) -> None:
     """col() 返回 Column，链式 .desc() 与直接 column.desc() 等价。"""
     query = session.query(User).order_by(col(User.name).desc())
@@ -383,6 +395,11 @@ def test_join_left_join(session: Session) -> None:
 
     assert 'LEFT JOIN "posts" ON "users"."id" = "posts"."user_id"' in sql
     assert params == []
+
+
+def test_join_rejects_unsupported_type(session: Session) -> None:
+    with pytest.raises(ValueError, match="join type must be 'INNER' or 'LEFT'"):
+        session.query(User).join(Post, on=User.id == Post.user_id, type="RIGHT")
 
 
 def test_join_count(session: Session) -> None:

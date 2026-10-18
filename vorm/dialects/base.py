@@ -184,13 +184,21 @@ class AbstractDialect(ABC):
     # SQL 生成
     # ------------------------------------------------------------------
 
-    def build_select(self, query: QuerySet[Any], *, count: bool = False) -> tuple[str, list[Any]]:
+    def build_select(
+        self, query: QuerySet[Any], *, count: bool = False, exists: bool = False
+    ) -> tuple[str, list[Any]]:
         params: list[Any] = []
         model = query.model
         table = self.quote_identifier(model.__table__)
 
         if count:
             sql = f"SELECT COUNT(*) AS count FROM {table}"
+            for j in query.joins:
+                jt = self.quote_identifier(j.model.__table__)
+                on_clause = j.on.render(self, params)
+                sql = f"{sql} {j.join_type} JOIN {jt} ON {on_clause}"
+        elif exists:
+            sql = f"SELECT 1 FROM {table}"
             for j in query.joins:
                 jt = self.quote_identifier(j.model.__table__)
                 on_clause = j.on.render(self, params)
@@ -228,13 +236,16 @@ class AbstractDialect(ABC):
         if query.filters:
             where = " AND ".join(expr.render(self, params) for expr in query.filters)
             sql = f"{sql} WHERE {where}"
-        if query.orderings and not count:
+        if query.orderings and not count and not exists:
             order_by = ", ".join(order.render(self) for order in query.orderings)
             sql = f"{sql} ORDER BY {order_by}"
-        if query.limit_count is not None and not count:
+        if exists:
+            params.append(1)
+            sql = f"{sql} LIMIT {self.render_placeholder(len(params))}"
+        elif query.limit_count is not None and not count:
             params.append(query.limit_count)
             sql = f"{sql} LIMIT {self.render_placeholder(len(params))}"
-        if query.offset_count is not None and not count:
+        if query.offset_count is not None and not count and not exists:
             params.append(query.offset_count)
             sql = f"{sql} OFFSET {self.render_placeholder(len(params))}"
         return sql, params

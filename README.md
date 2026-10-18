@@ -159,14 +159,22 @@ class Article(Model):
 ```python
 from vorm.engine import create_mysql_engine, create_postgresql_engine
 
-# Mysql 连接池（推荐）
-mysql_engine = await engine.create_mysql_engine(host="127.0.0.1",port=3306,user="username",password="password",database="test",minsize=10,maxsize=20)
+# MySQL 连接池（推荐）
+mysql_engine = await create_mysql_engine(
+    host="127.0.0.1", port=3306, user="username",
+    password="password", database="test", minsize=10, maxsize=20
+)
 session = mysql_engine.session()
 
 # PostgreSQL 连接池（推荐）
-postgresql_engine = await engine.create_postgresql_engine(host="127.0.0.1",port=3306,user="username",password="password",database="test",min_size=50,max_size=100)
+postgresql_engine = await create_postgresql_engine(
+    host="127.0.0.1", port=5432, user="username",
+    password="password", database="test", min_size=50, max_size=100
+)
 session = postgresql_engine.session()
 ```
+
+应用关闭时调用 `await mysql_engine.close()` 或 `await postgresql_engine.close()` 释放连接池。
 
 ### 3. 建表 & 索引
 

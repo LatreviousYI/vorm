@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
@@ -146,6 +147,26 @@ async def test_engine_transaction_rollback() -> None:
     with pytest.raises(TestError):
         async with eng.transaction():
             raise TestError("模拟异常")
+
+
+async def test_session_transaction_rolls_back_on_cancellation() -> None:
+    """取消事务中的任务时也必须释放数据库事务。"""
+    class TrackingDialect(_TestDialect):
+        def __init__(self) -> None:
+            super().__init__(object())
+            self.rollback_called = False
+
+        async def rollback(self) -> None:
+            self.rollback_called = True
+
+    dialect = TrackingDialect()
+    session = Session(dialect)
+
+    with pytest.raises(asyncio.CancelledError):
+        async with session.transaction():
+            raise asyncio.CancelledError
+
+    assert dialect.rollback_called is True
 
 
 # ---------------------------------------------------------------------------
