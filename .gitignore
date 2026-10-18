@@ -20,3 +20,5 @@ task_plan.md
 
 
 art/
+.env
+scripts/

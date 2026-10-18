@@ -122,17 +122,25 @@ class MySQLDialect(AbstractDialect):
         """
         import re
 
-        t = db_type.lower().strip()
-        # 去掉整型显示宽度：bigint(20) → bigint, int(11) → int, tinyint(1) → tinyint
-        t = re.sub(r"^(tinyint|smallint|mediumint|int|bigint)\(\d+\)$", r"\1", t)
-        # 类型别名
-        t = t.replace("integer", "int")
-        t = t.replace("boolean", "bool")
-        t = t.replace("tinyint", "bool")  # MySQL TINYINT(1) ≡ BOOL
+        raw_type = db_type.lower().strip()
+        # MySQL reports BOOL/BOOLEAN as TINYINT(1), while a real TINYINT
+        # column is reported as TINYINT without a display width.
+        integer_match = re.fullmatch(r"(tinyint|smallint|mediumint|int|bigint)\((\d+)\)", raw_type)
+        if integer_match:
+            base, width = integer_match.groups()
+            t = "bool" if base == "tinyint" and width == "1" else base
+        else:
+            t = raw_type
+
+        # Type aliases returned by MySQL (and common explicit db_type values).
+        t = re.sub(r"\binteger\b", "int", t)
+        t = re.sub(r"\bboolean\b", "bool", t)
         t = t.replace("double precision", "double")
         t = t.replace("character varying", "varchar")
         t = t.replace("timestamp without time zone", "timestamp")
         t = t.replace("timestamp with time zone", "timestamptz")
+        t = re.sub(r"\bgeomcollection\b", "geometrycollection", t)
+        t = re.sub(r"\bnumeric\b", "decimal", t)
         return t
 
     def _normalize_column_default(self, raw: Any) -> str:
@@ -243,7 +251,7 @@ class MySQLDialect(AbstractDialect):
         new_type = self.map_python_type(annotation, info)
 
         # AUTO_INCREMENT 不在 MySQL COLUMN_TYPE 里，去掉后单独比对
-        new_normalized = new_type.lower().replace(" auto_increment", "")
+        new_normalized = self._normalize_type(new_type.lower().replace(" auto_increment", ""))
         type_changed = self._normalize_type(existing.data_type) != new_normalized
         null_changed = info.nullable != existing.is_nullable
         default_changed = self._default_changed(model, field_name, existing)
@@ -368,7 +376,7 @@ class MySQLDialect(AbstractDialect):
 
             old_normalized = self._normalize_type(existing.data_type)
             # AUTO_INCREMENT 不在 MySQL COLUMN_TYPE 里，去掉后单独比对
-            new_normalized = new_type.lower().replace(" auto_increment", "")
+            new_normalized = self._normalize_type(new_type.lower().replace(" auto_increment", ""))
 
             type_changed = old_normalized != new_normalized
             null_changed = info.nullable != existing.is_nullable
@@ -470,7 +478,7 @@ class MySQLDialect(AbstractDialect):
 
             old_normalized = self._normalize_type(existing.data_type)
             # AUTO_INCREMENT 不在 MySQL COLUMN_TYPE 里，比对时去掉
-            new_normalized = new_type.lower().replace(" auto_increment", "")
+            new_normalized = self._normalize_type(new_type.lower().replace(" auto_increment", ""))
 
             type_changed = old_normalized != new_normalized
             null_changed = info.nullable != existing.is_nullable
