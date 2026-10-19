@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
     from vorm.dialects.base import AbstractDialect
+    from vorm.model import Model
 
 
 @dataclass(frozen=True)
@@ -173,7 +174,7 @@ class CombinedExpression(Expression):
 
 @dataclass(frozen=True)
 class Column:
-    model: type
+    model: type[Model]
     field_name: str
     column_name: str
 
@@ -250,4 +251,4 @@ def col(column: Any) -> Column:
 
     本质是带类型标注的恒等函数，运行时原样返回传入的 ``Column``。
     """
-    return column
+    return cast("Column", column)

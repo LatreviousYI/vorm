@@ -76,12 +76,12 @@ class PostgreSQLDialect(AbstractDialect):
         return result
 
     @staticmethod
-    def _parse_json_path(path: str) -> list:
+    def _parse_json_path(path: str) -> list[str | int]:
         """Parse a JSON path like ``$.key.sub[0].name`` into ``['key', 'sub', 0, 'name']``."""
         if not path.startswith("$"):
             return [path]
 
-        result: list = []
+        result: list[str | int] = []
         # Match .key or [index]
         tokens = re.findall(r"\.(\w+)|\[(\d+)\]", path)
         for dot_match, bracket_match in tokens:

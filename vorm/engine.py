@@ -4,17 +4,20 @@ import asyncio
 import logging
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 from vorm.session import Session
 
+if TYPE_CHECKING:
+    from vorm.dialects.base import AbstractDialect
+
 logger = logging.getLogger("vorm")
 
-if TYPE_CHECKING:
-    from vorm.dialects.mysql import MySQLDialect
-    from vorm.dialects.postgresql import PostgreSQLDialect
-
 _PoolFactory = Callable[[], Any]  # async () -> (pool, on_close)
+
+
+class DialectFactory(Protocol):
+    def __call__(self, pool: Any, *, _owns_pool: bool = True) -> AbstractDialect: ...
 
 
 class Engine:
@@ -26,7 +29,7 @@ class Engine:
 
     def __init__(
         self,
-        dialect_class: type[MySQLDialect | PostgreSQLDialect],
+        dialect_class: DialectFactory,
         pool: Any,
         on_close: Callable[[], Any],
         factory: _PoolFactory | None = None,
@@ -59,7 +62,7 @@ class Engine:
     async def ping(self) -> bool:
         """快捷健康检查。"""
         session = self.session()
-        ok = await session.dialect.ping()
+        ok: bool = await session.dialect.ping()
         if not ok:
             logger.warning("健康检查失败：数据库不可达")
         return ok

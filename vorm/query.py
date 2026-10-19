@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json as _json_mod
 from dataclasses import dataclass
-from typing import Any, Generic, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Generic, TypeVar, cast
 
 from pydantic import BaseModel, TypeAdapter
 
@@ -10,6 +10,9 @@ from vorm.exceptions import DoesNotExist, MultipleObjectsReturned
 from vorm.expression import AliasedColumn, Column, Expression, OrderExpression
 from vorm.model import Model
 from vorm.row import Row
+
+if TYPE_CHECKING:
+    from vorm.session import Session
 
 ModelT = TypeVar("ModelT", bound=Model)
 SerializationModel = TypeVar("SerializationModel", bound=BaseModel)
@@ -25,7 +28,7 @@ class JoinInfo:
 
 
 class QuerySet(Generic[ModelT]):
-    def __init__(self, session: Any, model: type[ModelT]) -> None:
+    def __init__(self, session: Session, model: type[ModelT]) -> None:
         self.session = session
         self.model = model
         self.filters: list[Expression] = []
@@ -103,7 +106,7 @@ class QuerySet(Generic[ModelT]):
         return clone
 
     def build_sql(self) -> tuple[str, list[Any]]:
-        return cast(tuple[str, list[Any]], self.session.dialect.build_select(self))
+        return self.session.dialect.build_select(self)
 
     # -- 执行 ---------------------------------------------------------------
 
@@ -116,11 +119,11 @@ class QuerySet(Generic[ModelT]):
 
         # select() 模式：直接返回数据库行字典
         if self._selected is not None:
-            return rows
+            return cast("list[ModelT]", rows)
 
         if self.joins:
             table_names = self._table_names()
-            return [Row(row, table_names) for row in rows]  # type: ignore[return-value]
+            return cast("list[ModelT]", [Row(row, table_names) for row in rows])
 
         # 将 JSON 字符串反序列化为 Python 对象再交给 Pydantic 校验
         json_fields = self.model.__json_fields__

@@ -4,7 +4,8 @@ import enum
 import hashlib
 import typing
 from dataclasses import dataclass
-from typing import Any
+from types import UnionType
+from typing import Any, cast
 
 
 @dataclass(frozen=True)
@@ -61,20 +62,21 @@ def timestamp_function_name(table_name: str, column_name: str) -> str:
     return _postgresql_identifier(f"vorm_ts_{table_name}_{column_name}_fn")
 
 
-def resolve_base_type(annotation: Any) -> type:
+def resolve_base_type(annotation: Any) -> type[Any]:
     """Unwrap ``Optional[X]`` / ``X | None`` and parameterised generics.
 
     ``Optional[str]`` → ``str``; ``dict[str, Any]`` → ``dict``.
     """
+    origin = typing.get_origin(annotation)
     args = typing.get_args(annotation)
-    if args:
+    if origin is typing.Union or isinstance(annotation, UnionType):
         non_none = [a for a in args if a is not type(None)]
         if len(non_none) == 1:
-            return non_none[0]
-    origin = typing.get_origin(annotation)
+            return resolve_base_type(non_none[0])
+        return cast("type[Any]", annotation)
     if origin is not None:
-        return origin
-    return annotation
+        return cast("type[Any]", origin)
+    return cast("type[Any]", annotation)
 
 
 def is_optional(annotation: Any) -> bool:
@@ -94,4 +96,6 @@ def is_enum_type(annotation: Any) -> bool:
 def get_enum_values(annotation: Any) -> list[Any]:
     """Return the list of member values from an ``enum.Enum`` subclass."""
     base = resolve_base_type(annotation)
-    return [member.value for member in base.__members__.values()]
+    if isinstance(base, type) and issubclass(base, enum.Enum):
+        return [member.value for member in base.__members__.values()]
+    return []

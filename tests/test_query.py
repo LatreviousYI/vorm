@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
-from vorm import Field, Model, Session
+from vorm import Field, Model, Session, col
 from vorm.dialects.base import AbstractDialect
 from vorm.exceptions import DoesNotExist, MultipleObjectsReturned
+from vorm.row import Row, RowSnapshot
 
 
 class ConfigurableDialect(AbstractDialect):
@@ -226,7 +227,7 @@ async def test_count_with_filter(session: Session, dialect: ConfigurableDialect)
     """Filters affect the COUNT query."""
     dialect.fetchrow_result = {"count": 2}
 
-    total = await session.query(User).filter(User.age > 18).count()
+    total = await session.query(User).filter(col(User.age) > 18).count()
 
     assert total == 2
     assert "WHERE" in dialect.last_sql
@@ -272,9 +273,12 @@ async def test_exists_with_join_includes_join_and_filter(
 ) -> None:
     dialect.fetchrow_result = {"?column?": 1}
 
-    result = await session.query(User).join(Post, on=User.id == Post.user_id).filter(
-        Post.title == "Hello"
-    ).exists()
+    result = (
+        await session.query(User)
+        .join(Post, on=col(User.id) == col(Post.user_id))
+        .filter(col(Post.title) == "Hello")
+        .exists()
+    )
 
     assert result is True
     assert 'INNER JOIN "posts"' in dialect.last_sql
@@ -294,8 +298,8 @@ async def test_chained_query_all_methods(session: Session, dialect: Configurable
 
     users = (
         await session.query(User)
-        .filter(User.age >= 18)
-        .order_by(User.name.asc())
+        .filter(col(User.age) >= 18)
+        .order_by(col(User.name).asc())
         .limit(10)
         .offset(0)
         .all()
@@ -371,11 +375,12 @@ async def test_join_all_returns_row_objects(
     session: Session, dialect: ConfigurableDialect, join_rows: list[dict[str, Any]]
 ) -> None:
     """带 JOIN 的查询 .all() 应返回 Row 对象，而非 Model 实例。"""
-    from vorm.row import Row
-
     dialect.fetch_rows = join_rows
 
-    rows = await session.query(User).join(Post, on=User.id == Post.user_id).all()
+    rows = cast(
+        "list[Row]",
+        await session.query(User).join(Post, on=col(User.id) == col(Post.user_id)).all(),
+    )
 
     assert len(rows) == 3
     assert all(isinstance(r, Row) for r in rows)
@@ -385,11 +390,12 @@ async def test_join_row_table_attr_access(
     session: Session, dialect: ConfigurableDialect, join_rows: list[dict[str, Any]]
 ) -> None:
     """Row 对象支持 row.users.name 形式的属性访问。"""
-    from vorm.row import RowSnapshot
-
     dialect.fetch_rows = join_rows
 
-    rows = await session.query(User).join(Post, on=User.id == Post.user_id).all()
+    rows = cast(
+        "list[Row]",
+        await session.query(User).join(Post, on=col(User.id) == col(Post.user_id)).all(),
+    )
 
     # row.users 返回 RowSnapshot
     assert isinstance(rows[0].users, RowSnapshot)
@@ -408,7 +414,10 @@ async def test_join_row_bracket_access(
     """Row 支持 row["users.id"] 和 row["users_id"] 两种字符串访问。"""
     dialect.fetch_rows = join_rows
 
-    rows = await session.query(User).join(Post, on=User.id == Post.user_id).all()
+    rows = cast(
+        "list[Row]",
+        await session.query(User).join(Post, on=col(User.id) == col(Post.user_id)).all(),
+    )
 
     assert rows[0]["users.id"] == 1
     assert rows[0]["users_name"] == "Alice"
@@ -421,7 +430,10 @@ async def test_join_row_dict_conversion(
     """dict(row) 返回扁平字典。"""
     dialect.fetch_rows = join_rows
 
-    rows = await session.query(User).join(Post, on=User.id == Post.user_id).all()
+    rows = cast(
+        "list[Row]",
+        await session.query(User).join(Post, on=col(User.id) == col(Post.user_id)).all(),
+    )
 
     d = dict(rows[0])
     assert d["users_id"] == 1
@@ -433,11 +445,12 @@ async def test_join_first(
     session: Session, dialect: ConfigurableDialect, join_rows: list[dict[str, Any]]
 ) -> None:
     """.first() 配合 JOIN 应返回单个 Row。"""
-    from vorm.row import Row
-
     dialect.fetch_rows = [join_rows[0]]
 
-    row = await session.query(User).join(Post, on=User.id == Post.user_id).first()
+    row = cast(
+        "Row",
+        await session.query(User).join(Post, on=col(User.id) == col(Post.user_id)).first(),
+    )
 
     assert isinstance(row, Row)
     assert row.users.name == "Alice"
@@ -448,11 +461,12 @@ async def test_join_one(
     session: Session, dialect: ConfigurableDialect, join_rows: list[dict[str, Any]]
 ) -> None:
     """.one() 配合 JOIN 应返回单个 Row。"""
-    from vorm.row import Row
-
     dialect.fetch_rows = [join_rows[0]]
 
-    row = await session.query(User).join(Post, on=User.id == Post.user_id).one()
+    row = cast(
+        "Row",
+        await session.query(User).join(Post, on=col(User.id) == col(Post.user_id)).one(),
+    )
 
     assert isinstance(row, Row)
     assert row.users.name == "Alice"
@@ -460,8 +474,6 @@ async def test_join_one(
 
 async def test_join_three_tables(session: Session, dialect: ConfigurableDialect) -> None:
     """三表 JOIN 的 Row 应包含三张表的字段。"""
-    from vorm.row import Row, RowSnapshot
-
     dialect.fetch_rows = [
         {
             "users_id": 1,
@@ -479,8 +491,8 @@ async def test_join_three_tables(session: Session, dialect: ConfigurableDialect)
 
     rows = (
         await session.query(User)
-        .join(Post, on=User.id == Post.user_id)
-        .join(Comment, on=Post.id == Comment.post_id)
+        .join(Post, on=col(User.id) == col(Post.user_id))
+        .join(Comment, on=col(Post.id) == col(Comment.post_id))
         .all()
     )
 
@@ -519,7 +531,7 @@ async def test_filter_like(session: Session, dialect: ConfigurableDialect) -> No
         {"id": 1, "name": "Alice", "email": "alice@e.com", "age": 30},
     ]
 
-    users = await session.query(User).filter(User.name.like("A%")).all()
+    users = await session.query(User).filter(col(User.name).like("A%")).all()
 
     assert len(users) == 1
     assert "LIKE" in dialect.last_sql
@@ -532,7 +544,7 @@ async def test_filter_between(session: Session, dialect: ConfigurableDialect) ->
         {"id": 1, "name": "Alice", "email": "alice@e.com", "age": 30},
     ]
 
-    users = await session.query(User).filter(User.age.between(20, 40)).all()
+    users = await session.query(User).filter(col(User.age).between(20, 40)).all()
 
     assert len(users) == 1
     assert "BETWEEN" in dialect.last_sql
@@ -552,14 +564,16 @@ def raw_session() -> Session:
 
 async def test_execute_raw_delegates_to_dialect(raw_session: Session) -> None:
     """execute_raw 应将 SQL 和参数透传给 dialect.execute。"""
-    raw_session.dialect.execute_result = 1
+    dialect = cast(ConfigurableDialect, raw_session.dialect)
+    dialect.execute_result = 1
     result = await raw_session.execute_raw("DELETE FROM users WHERE id = %s", [1])
     assert result == 1
 
 
 async def test_fetch_raw_delegates_to_dialect(raw_session: Session) -> None:
     """fetch_raw 应返回 dialect.fetch 的结果。"""
-    raw_session.dialect.fetch_rows = [{"id": 1, "name": "Alice"}]
+    dialect = cast(ConfigurableDialect, raw_session.dialect)
+    dialect.fetch_rows = [{"id": 1, "name": "Alice"}]
     rows = await raw_session.fetch_raw("SELECT * FROM users")
     assert len(rows) == 1
     assert rows[0]["name"] == "Alice"
@@ -567,11 +581,12 @@ async def test_fetch_raw_delegates_to_dialect(raw_session: Session) -> None:
 
 async def test_fetch_one_raw_delegates_to_dialect(raw_session: Session) -> None:
     """fetch_one_raw 应返回单行或 None。"""
-    raw_session.dialect.fetchrow_result = {"id": 1}
+    dialect = cast(ConfigurableDialect, raw_session.dialect)
+    dialect.fetchrow_result = {"id": 1}
     row = await raw_session.fetch_one_raw("SELECT * FROM users WHERE id = 1")
     assert row == {"id": 1}
 
-    raw_session.dialect.fetchrow_result = None
+    dialect.fetchrow_result = None
     row = await raw_session.fetch_one_raw("SELECT * FROM users WHERE id = 999")
     assert row is None
 
@@ -583,8 +598,9 @@ async def test_fetch_one_raw_delegates_to_dialect(raw_session: Session) -> None:
 
 async def test_ping_succeeds(raw_session: Session) -> None:
     """ping 应执行 SELECT 1 并返回 True。"""
-    raw_session.dialect.fetchrow_result = {"ok": 1}
-    ok = await raw_session.dialect.ping()
+    dialect = cast(ConfigurableDialect, raw_session.dialect)
+    dialect.fetchrow_result = {"ok": 1}
+    ok = await dialect.ping()
     assert ok is True
 
 
@@ -611,7 +627,10 @@ async def test_select_all_returns_dicts(
     """select() 模式下 all() 应直接返回数据库行字典，不构建 Model。"""
     dialect.fetch_rows = sample_rows
 
-    rows = await session.query(User).select(User.id, User.name).all()
+    rows = cast(
+        "list[dict[str, Any]]",
+        await session.query(User).select(col(User.id), col(User.name)).all(),
+    )
 
     assert len(rows) == 3
     assert all(isinstance(r, dict) for r in rows)
@@ -627,7 +646,10 @@ async def test_select_first_returns_dict(
     """select() 模式下 first() 应返回单个 dict。"""
     dialect.fetch_rows = [sample_rows[0]]
 
-    row = await session.query(User).select(User.id, User.name).first()
+    row = cast(
+        "dict[str, Any] | None",
+        await session.query(User).select(col(User.id), col(User.name)).first(),
+    )
 
     assert isinstance(row, dict)
     assert "id" in row
@@ -640,7 +662,10 @@ async def test_select_one_returns_dict(
     """select() 模式下 one() 应返回单个 dict。"""
     dialect.fetch_rows = [sample_rows[0]]
 
-    row = await session.query(User).select(User.id, User.name).one()
+    row = cast(
+        "dict[str, Any]",
+        await session.query(User).select(col(User.id), col(User.name)).one(),
+    )
 
     assert isinstance(row, dict)
     assert "id" in row

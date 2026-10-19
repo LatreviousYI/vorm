@@ -151,6 +151,7 @@ async def test_engine_transaction_rollback() -> None:
 
 async def test_session_transaction_rolls_back_on_cancellation() -> None:
     """取消事务中的任务时也必须释放数据库事务。"""
+
     class TrackingDialect(_TestDialect):
         def __init__(self) -> None:
             super().__init__(object())
@@ -246,7 +247,7 @@ async def test_engine_ping_healthy() -> None:
 async def test_engine_ping_unhealthy() -> None:
     """Engine.ping() 应返回 False（数据库不可达时）。"""
     eng = Engine(_PingDialect, object(), on_close=lambda: None)
-    eng._dialect_class = lambda pool, **kw: _PingDialect(pool, ping_ok=False)  # type: ignore[assignment]
+    eng._dialect_class = lambda pool, **kw: _PingDialect(pool, ping_ok=False)
     ok = await eng.ping()
     assert ok is False
 

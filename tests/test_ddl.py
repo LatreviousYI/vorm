@@ -337,7 +337,7 @@ def test_build_create_table_json_dict(dialect: DDLDialect) -> None:
             table = "products"
 
         id: int = Field(primary_key=True, auto_increment=True)
-        data: dict
+        data: dict[str, Any]
 
     sql = dialect.build_create_table(Product)
     assert '"data" JSONB' in sql
@@ -351,7 +351,7 @@ def test_build_create_table_json_list(dialect: DDLDialect) -> None:
             table = "products"
 
         id: int = Field(primary_key=True, auto_increment=True)
-        tags: list
+        tags: list[Any]
 
     sql = dialect.build_create_table(Product)
     assert '"tags" JSONB' in sql
@@ -365,7 +365,7 @@ def test_build_create_table_json_default_dict(dialect: DDLDialect) -> None:
             table = "products"
 
         id: int = Field(primary_key=True, auto_increment=True)
-        config: dict = Field(default_factory=dict)
+        config: dict[str, Any] = Field(default_factory=dict)
 
     sql = dialect.build_create_table(Product)
     assert '"config" JSONB' in sql
@@ -381,7 +381,7 @@ def test_build_create_table_json_default_list(dialect: DDLDialect) -> None:
             table = "products"
 
         id: int = Field(primary_key=True, auto_increment=True)
-        tags: list = Field(default_factory=list)
+        tags: list[Any] = Field(default_factory=list)
 
     sql = dialect.build_create_table(Product)
     assert '"tags" JSONB' in sql
@@ -397,7 +397,7 @@ def test_build_create_table_json_default_dict_with_values(dialect: DDLDialect) -
             table = "products"
 
         id: int = Field(primary_key=True, auto_increment=True)
-        config: dict = Field(default_factory=lambda: {"theme": "dark", "count": 2})
+        config: dict[str, Any] = Field(default_factory=lambda: {"theme": "dark", "count": 2})
 
     sql = dialect.build_create_table(Product)
     assert '"config" JSONB' in sql
@@ -419,7 +419,7 @@ def test_build_create_table_json_default_nested(dialect: DDLDialect) -> None:
             table = "products"
 
         id: int = Field(primary_key=True, auto_increment=True)
-        meta: dict = Field(default_factory=lambda: {"tags": ["a", "b"], "count": 1})
+        meta: dict[str, Any] = Field(default_factory=lambda: {"tags": ["a", "b"], "count": 1})
 
     sql = dialect.build_create_table(Product)
     assert '"meta" JSONB' in sql
@@ -1356,7 +1356,7 @@ def test_postgresql_timestamp_default_variants_are_equivalent() -> None:
     """PG 的 now() 与 CURRENT_TIMESTAMP 应视为相同数据库默认值。"""
     from vorm.dialects.postgresql import PostgreSQLDialect
 
-    dialect = PostgreSQLDialect(pool=None)  # type: ignore[arg-type]
+    dialect = PostgreSQLDialect(pool=None)
     existing = IntrospectedColumn(
         "created_at",
         "timestamp without time zone",
@@ -1386,7 +1386,7 @@ def test_postgresql_timestamp_trigger_ddl() -> None:
     """PG update/both 时间戳应生成确定命名的触发器。"""
     from vorm.dialects.postgresql import PostgreSQLDialect
 
-    dialect = PostgreSQLDialect(pool=None)  # type: ignore[arg-type]
+    dialect = PostgreSQLDialect(pool=None)
     sqls = dialect.build_timestamp_ddl(
         TimestampDDLModel,
         table_exists=False,
@@ -1444,7 +1444,7 @@ def test_postgresql_timestamp_trigger_sync_is_idempotent() -> None:
     """已有确定命名的 PG trigger 不应重复生成 DDL。"""
     from vorm.dialects.postgresql import PostgreSQLDialect
 
-    dialect = PostgreSQLDialect(pool=None)  # type: ignore[arg-type]
+    dialect = PostgreSQLDialect(pool=None)
     trigger_name = "vorm_ts_timestamp_ddl_updated_at_update"
     sqls = dialect.build_timestamp_ddl(
         TimestampDDLModel,
@@ -1459,7 +1459,7 @@ def test_postgresql_timestamp_trigger_is_removed_when_behavior_changes() -> None
     """切换为 create 时只删除 VORM 自己管理的 trigger。"""
     from vorm.dialects.postgresql import PostgreSQLDialect
 
-    dialect = PostgreSQLDialect(pool=None)  # type: ignore[arg-type]
+    dialect = PostgreSQLDialect(pool=None)
     trigger_name = "vorm_ts_timestamp_ddl_updated_at_update"
     sqls = dialect.build_timestamp_ddl(
         TimestampCreateOnlyModel,
