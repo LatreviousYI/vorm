@@ -139,6 +139,16 @@ class AbstractDialect(ABC):
         except Exception:
             return False
 
+    def _resolve_pool(self) -> Any:
+        """返回当前实际连接池。
+
+        ``self.pool`` 可能是可变池引用（``PoolRef``，``Engine.reconnect()``
+        换池时原地替换）。事务连接跨 await 持有，归还时必须用获取它的来源池。
+        """
+        pool = self.pool
+        current = getattr(pool, "current", None)
+        return current() if callable(current) else pool
+
     # ------------------------------------------------------------------
     # DDL 批处理
     # ------------------------------------------------------------------

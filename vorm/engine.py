@@ -20,6 +20,30 @@ class DialectFactory(Protocol):
     def __call__(self, pool: Any, *, _owns_pool: bool = True) -> AbstractDialect: ...
 
 
+class PoolRef:
+    """可变连接池引用。
+
+    ``Engine.reconnect()`` 换池时通过 :meth:`swap` 原地替换内部池，
+    已创建的 Session / Dialect 自动使用新池，不会持有已关闭的旧池。
+    """
+
+    __slots__ = ("_pool",)
+
+    def __init__(self, pool: Any) -> None:
+        self._pool = pool
+
+    def swap(self, pool: Any) -> None:
+        """原地替换内部池，所有引用方立即看到新池。"""
+        self._pool = pool
+
+    def current(self) -> Any:
+        """返回当前实际连接池。"""
+        return self._pool
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._pool, name)
+
+
 class Engine:
     """数据库引擎：持有连接池，按需创建 Session。
 
@@ -35,13 +59,22 @@ class Engine:
         factory: _PoolFactory | None = None,
     ) -> None:
         self._dialect_class = dialect_class
-        self._pool = pool
+        self._pool_ref = PoolRef(pool)
         self._on_close = on_close
         self._factory = factory
 
+    @property
+    def _pool(self) -> Any:
+        """当前实际连接池（reconnect() 换池后自动指向新池）。"""
+        return self._pool_ref.current()
+
     def session(self) -> Session:
-        """基于共享连接池创建一个新 Session。"""
-        dialect = self._dialect_class(self._pool, _owns_pool=False)
+        """基于共享连接池创建一个新 Session。
+
+        Session 通过可变池引用（PoolRef）访问连接池，reconnect() 换池后
+        已创建的 Session 自动使用新池。
+        """
+        dialect = self._dialect_class(self._pool_ref, _owns_pool=False)
         return Session(dialect)
 
     @asynccontextmanager
@@ -67,8 +100,14 @@ class Engine:
             logger.warning("健康检查失败：数据库不可达")
         return ok
 
-    async def reconnect(self) -> bool:
-        """关闭旧连接池，创建新连接池。成功返回 True。"""
+    async def reconnect(self, *, retries: int = 3, backoff: float = 0.5) -> bool:
+        """关闭旧连接池并创建新连接池，失败自动重试（指数退避）。
+
+        - 旧池关闭失败不影响重连
+        - 换池通过 PoolRef 原地完成，已创建的 Session 自动使用新池
+        - 建池失败最多重试 ``retries`` 次，第 n 次失败后等待
+          ``backoff * 2 ** (n - 1)`` 秒；全部失败返回 False
+        """
         if self._factory is None:
             logger.warning("重连失败：未设置工厂函数")
             return False
@@ -77,13 +116,28 @@ class Engine:
             await self._on_close()
         except Exception:
             pass
-        try:
-            self._pool, self._on_close = await self._factory()
-            logger.info("数据库重连成功")
-            return True
-        except Exception as exc:
-            logger.error("数据库重连失败：%s", exc)
-            return False
+        delay = backoff
+        for attempt in range(1, retries + 1):
+            try:
+                pool, on_close = await self._factory()
+                self._pool_ref.swap(pool)
+                self._on_close = on_close
+                logger.info("数据库重连成功")
+                return True
+            except Exception as exc:
+                if attempt >= retries:
+                    logger.error("数据库重连失败（已重试 %d 次）：%s", retries, exc)
+                    return False
+                logger.warning(
+                    "数据库重连失败（第 %d/%d 次），%.1f 秒后重试：%s",
+                    attempt,
+                    retries,
+                    delay,
+                    exc,
+                )
+                await asyncio.sleep(delay)
+                delay *= 2
+        return False
 
     async def health_monitor(self, interval: float = 30) -> None:
         """后台协程：周期 ping，断连自动重连。永不退出。

@@ -297,3 +297,129 @@ async def test_engine_health_monitor_runs_one_cycle() -> None:
         await task
     except asyncio.CancelledError:
         pass
+
+
+# ---------------------------------------------------------------------------
+# reconnect() 与 PoolRef
+# ---------------------------------------------------------------------------
+
+
+def test_pool_ref_delegates_and_swaps() -> None:
+    """PoolRef 应代理属性访问并支持原地换池。"""
+    from vorm.engine import PoolRef
+
+    class _Target:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def hello(self) -> str:
+            return self.name
+
+    old, new = _Target("old"), _Target("new")
+    ref = PoolRef(old)
+    assert ref.hello() == "old"
+    assert ref.current() is old
+    ref.swap(new)
+    assert ref.hello() == "new"
+    assert ref.current() is new
+
+
+async def test_engine_session_survives_reconnect() -> None:
+    """reconnect() 换池后，已创建的 Session 应自动使用新池。"""
+    pools = [object(), object()]
+
+    async def _noop_close() -> None:
+        pass
+
+    async def _factory() -> Any:
+        return pools[1], _noop_close
+
+    eng = Engine(_TestDialect, pools[0], _noop_close, _factory)
+    session = eng.session()
+    ref = session.dialect.pool
+
+    ok = await eng.reconnect()
+    assert ok is True
+    assert eng._pool is pools[1]
+    # 同一个 PoolRef 原地换池：旧 session 无需重建即可看到新池
+    assert session.dialect.pool is ref
+    assert session.dialect.pool.current() is pools[1]
+    # 旧 session 仍可正常执行
+    await session.execute_raw("SELECT 1", [])
+    await session.close()
+
+
+async def test_engine_reconnect_retries_with_backoff() -> None:
+    """建池失败应按指数退避重试，最终成功返回 True。"""
+    attempts = {"n": 0}
+
+    async def _noop_close() -> None:
+        pass
+
+    async def _factory() -> Any:
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            raise ConnectionError("boom")
+        return object(), _noop_close
+
+    eng = Engine(_TestDialect, object(), _noop_close, _factory)
+    ok = await eng.reconnect(retries=3, backoff=0)
+    assert ok is True
+    assert attempts["n"] == 3
+
+
+async def test_engine_reconnect_gives_up_after_retries() -> None:
+    """重试耗尽后应返回 False。"""
+    attempts = {"n": 0}
+
+    async def _noop_close() -> None:
+        pass
+
+    async def _factory() -> Any:
+        attempts["n"] += 1
+        raise ConnectionError("boom")
+
+    eng = Engine(_TestDialect, object(), _noop_close, _factory)
+    ok = await eng.reconnect(retries=3, backoff=0)
+    assert ok is False
+    assert attempts["n"] == 3
+
+
+async def test_mysql_dialect_tx_releases_to_origin_pool() -> None:
+    """事务连接应归还到获取它的来源池（换池后不串池）。"""
+    from vorm.dialects.mysql import MySQLDialect
+    from vorm.engine import PoolRef
+
+    class _FakeConn:
+        async def begin(self) -> None:
+            pass
+
+        async def commit(self) -> None:
+            pass
+
+    class _FakePool:
+        def __init__(self) -> None:
+            self.released: list[Any] = []
+
+        async def acquire(self) -> Any:
+            return _FakeConn()
+
+        async def release(self, conn: Any) -> None:
+            self.released.append(conn)
+
+    old_pool = _FakePool()
+    new_pool = _FakePool()
+    ref = PoolRef(old_pool)
+    dialect = MySQLDialect(ref, _owns_pool=False)
+
+    await dialect.begin()
+    assert dialect._tx_pool is old_pool
+
+    ref.swap(new_pool)  # 模拟事务进行中发生重连换池
+    await dialect.commit()
+
+    # 连接归还到来源池（旧池），而不是新池
+    assert len(old_pool.released) == 1
+    assert len(new_pool.released) == 0
+    assert dialect._tx_conn is None
+    assert dialect._tx_pool is None

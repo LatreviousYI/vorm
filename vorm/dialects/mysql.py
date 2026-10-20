@@ -21,6 +21,7 @@ class MySQLDialect(AbstractDialect):
     def __init__(self, pool: asyncmy.Pool, *, _owns_pool: bool = True) -> None:
         self.pool = pool
         self._tx_conn: asyncmy.Connection | None = None
+        self._tx_pool: Any = None
         self._owns_pool = _owns_pool
 
     def render_placeholder(self, index: int) -> str:
@@ -35,7 +36,9 @@ class MySQLDialect(AbstractDialect):
     async def begin(self) -> None:
         if self._tx_conn is not None:
             raise RuntimeError("Transaction already in progress")
-        self._tx_conn = await self.pool.acquire()
+        pool = self._resolve_pool()
+        self._tx_conn = await pool.acquire()
+        self._tx_pool = pool
         await self._tx_conn.begin()
 
     async def commit(self) -> None:
@@ -44,8 +47,9 @@ class MySQLDialect(AbstractDialect):
         try:
             await self._tx_conn.commit()
         finally:
-            await self.pool.release(self._tx_conn)
-            self._tx_conn = None
+            conn, self._tx_conn = self._tx_conn, None
+            pool, self._tx_pool = self._tx_pool, None
+            await pool.release(conn)
 
     async def rollback(self) -> None:
         if self._tx_conn is None:
@@ -53,8 +57,9 @@ class MySQLDialect(AbstractDialect):
         try:
             await self._tx_conn.rollback()
         finally:
-            await self.pool.release(self._tx_conn)
-            self._tx_conn = None
+            conn, self._tx_conn = self._tx_conn, None
+            pool, self._tx_pool = self._tx_pool, None
+            await pool.release(conn)
 
     # -- 执行 ---------------------------------------------------------------
 
@@ -106,8 +111,9 @@ class MySQLDialect(AbstractDialect):
 
     async def close(self) -> None:
         if self._tx_conn is not None:
-            await self.pool.release(self._tx_conn)
-            self._tx_conn = None
+            conn, self._tx_conn = self._tx_conn, None
+            pool, self._tx_pool = self._tx_pool, None
+            await pool.release(conn)
         if self._owns_pool:
             self.pool.close()
             await self.pool.wait_closed()

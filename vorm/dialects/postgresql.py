@@ -50,6 +50,7 @@ class PostgreSQLDialect(AbstractDialect):
     def __init__(self, pool: asyncpg.Pool, *, _owns_pool: bool = True) -> None:
         self.pool = pool
         self._tx_conn: asyncpg.Connection | None = None
+        self._tx_pool: Any = None
         self._owns_pool = _owns_pool
 
     def render_placeholder(self, index: int) -> str:
@@ -96,7 +97,9 @@ class PostgreSQLDialect(AbstractDialect):
     async def begin(self) -> None:
         if self._tx_conn is not None:
             raise RuntimeError("Transaction already in progress")
-        self._tx_conn = await self.pool.acquire()
+        pool = self._resolve_pool()
+        self._tx_conn = await pool.acquire()
+        self._tx_pool = pool
         await self._tx_conn.execute("BEGIN")
 
     async def commit(self) -> None:
@@ -107,7 +110,8 @@ class PostgreSQLDialect(AbstractDialect):
             await conn.execute("COMMIT")
         finally:
             self._tx_conn = None
-            await self.pool.release(conn)
+            pool, self._tx_pool = self._tx_pool, None
+            await pool.release(conn)
 
     async def rollback(self) -> None:
         conn = self._tx_conn
@@ -117,7 +121,8 @@ class PostgreSQLDialect(AbstractDialect):
             await conn.execute("ROLLBACK")
         finally:
             self._tx_conn = None
-            await self.pool.release(conn)
+            pool, self._tx_pool = self._tx_pool, None
+            await pool.release(conn)
 
     # -- 执行 ---------------------------------------------------------------
 
@@ -161,8 +166,9 @@ class PostgreSQLDialect(AbstractDialect):
 
     async def close(self) -> None:
         if self._tx_conn is not None:
-            await self.pool.release(self._tx_conn)
-            self._tx_conn = None
+            conn, self._tx_conn = self._tx_conn, None
+            pool, self._tx_pool = self._tx_pool, None
+            await pool.release(conn)
         if self._owns_pool:
             await self.pool.close()
 
