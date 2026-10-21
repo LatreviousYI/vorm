@@ -682,3 +682,98 @@ async def test_select_without_select_still_returns_models(
 
     assert len(users) == 3
     assert all(isinstance(u, User) for u in users)
+
+
+# ---------------------------------------------------------------------------
+# for_update() — 行锁执行守卫
+# ---------------------------------------------------------------------------
+
+
+async def test_for_update_outside_transaction_raises(session: Session) -> None:
+    """事务外执行 for_update() 查询应直接报错（锁无效或泄漏）。"""
+    with pytest.raises(RuntimeError, match="inside a transaction"):
+        await session.query(User).filter(col(User.id) == 1).for_update().all()
+
+    with pytest.raises(RuntimeError, match="inside a transaction"):
+        await session.query(User).for_update(skip_locked=True).first()
+
+    with pytest.raises(RuntimeError, match="inside a transaction"):
+        await session.query(User).for_update(nowait=True).one()
+
+
+async def test_for_update_inside_transaction_executes(
+    session: Session, dialect: ConfigurableDialect, sample_rows: list[dict[str, Any]]
+) -> None:
+    """事务内执行 for_update() 查询应生成带锁子句的 SQL。"""
+    dialect.fetch_rows = [sample_rows[0]]
+    dialect._tx_conn = object()  # 模拟显式事务进行中
+
+    try:
+        users = await (
+            session.query(User)
+            .filter(col(User.age) > 18)
+            .order_by(col(User.id))
+            .limit(1)
+            .for_update(skip_locked=True)
+            .all()
+        )
+
+        assert len(users) == 1
+        assert dialect.last_sql.endswith("FOR UPDATE SKIP LOCKED")
+    finally:
+        dialect._tx_conn = None
+
+
+async def test_for_update_in_transaction_property(session: Session) -> None:
+    """in_transaction 属性应正确反映 _tx_conn 状态。"""
+    dialect = session.dialect
+
+    assert dialect.in_transaction is False
+    dialect._tx_conn = object()
+    try:
+        assert dialect.in_transaction is True
+    finally:
+        dialect._tx_conn = None
+    assert dialect.in_transaction is False
+
+
+async def test_for_update_rejects_count_exists(session: Session) -> None:
+    """for_update() 与 count()/exists() 组合应报错（聚合不允许行锁）。"""
+    dialect = session.dialect
+    dialect._tx_conn = object()  # 即使在事务内也应拒绝
+
+    try:
+        with pytest.raises(ValueError, match="count"):
+            await session.query(User).for_update().count()
+
+        with pytest.raises(ValueError, match="exists"):
+            await session.query(User).for_update().exists()
+    finally:
+        dialect._tx_conn = None
+
+
+async def test_for_update_rejects_update_delete(session: Session) -> None:
+    """for_update() 与 update()/delete() 组合应报错（锁子句会被静默丢弃）。"""
+    dialect = session.dialect
+    dialect._tx_conn = object()
+
+    try:
+        with pytest.raises(ValueError, match="update"):
+            await session.query(User).for_update().update(age=1)
+
+        with pytest.raises(ValueError, match="delete"):
+            await session.query(User).for_update().delete()
+    finally:
+        dialect._tx_conn = None
+
+
+async def test_query_without_for_update_works_outside_transaction(
+    session: Session, dialect: ConfigurableDialect, sample_rows: list[dict[str, Any]]
+) -> None:
+    """普通查询不受事务守卫影响（回归验证）。"""
+    dialect.fetch_rows = sample_rows
+
+    users = await session.query(User).all()
+
+    assert len(users) == 3
+    assert not dialect.last_sql.endswith("FOR UPDATE")

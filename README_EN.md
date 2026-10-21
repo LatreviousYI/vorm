@@ -13,6 +13,7 @@
 - **Index management** — `Meta.indexes` for composite indexes, `Field(index=True)` for single-column. Additive only
 - **Auto-reconnect** — periodic health checks detect connection loss and rebuild the pool automatically (retried with exponential backoff); existing sessions switch to the new pool transparently
 - **Multi-table JOIN** — Explicit ON conditions with `Row` objects supporting both attribute and dictionary access
+- **Row locking** — `for_update()` / `for_update(skip_locked=True)` pessimistic locks; executing outside a transaction raises immediately
 - **Raw SQL** — `execute_raw()` / `fetch_raw()` / `fetch_one_raw()` to bypass the ORM when needed
 - **Enum support** — Python `enum.Enum` subclasses map to PostgreSQL custom enum types or MySQL inline `ENUM(...)`
 
@@ -315,6 +316,44 @@ async with session.transaction():
 # Health check
 ok = await session.dialect.ping()  # True → connection is healthy
 ```
+
+#### Row Locking (FOR UPDATE)
+
+`for_update()` takes exclusive row locks on the rows read (`SELECT ... FOR UPDATE`). Locks are held until the transaction commits or rolls back — use it to prevent lost updates between "read" and "write back". **Must run inside a transaction** — executing outside one raises `RuntimeError` immediately (under autocommit the lock is released the instant it is taken, i.e. no lock at all; without autocommit the lock leaks onto the pooled connection and is held indefinitely).
+
+```python
+# Read-modify-write: prevent lost updates
+async with session.transaction():
+    row = await (
+        session.query(Account)
+        .filter(col(Account.id) == 1)
+        .for_update()
+        .first()
+    )
+    row.balance -= 100
+    await session.save(row)
+    # Lock released on commit/rollback
+
+# Task queue: concurrent claiming with SKIP LOCKED, workers never wait on each other
+async with session.transaction():
+    msg = await (
+        session.query(Message)
+        .filter(Message.status == "pending")
+        .order_by(col(Message.id))
+        .limit(1)
+        .for_update(skip_locked=True)   # → FOR UPDATE SKIP LOCKED
+        .first()
+    )
+    if msg is not None:
+        msg.status = "processing"
+        await session.save(msg)
+    # On commit the row lock is released and status='processing' is visible to everyone
+```
+
+- `for_update(skip_locked=True)`: skip rows locked by other transactions instead of waiting (MySQL 8.0+ / PostgreSQL 9.5+)
+- `for_update(nowait=True)`: raise an error immediately on locked rows instead of waiting; mutually exclusive with `skip_locked`
+- Combining with `count()` / `exists()` / `update()` / `delete()` raises `ValueError` (the lock clause would be silently dropped or the SQL is invalid)
+- Keep transactions short: lock hold time = the whole transaction — never do network I/O while holding locks
 
 #### Pool Reconnection
 

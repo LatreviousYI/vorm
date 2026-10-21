@@ -149,6 +149,15 @@ class AbstractDialect(ABC):
         current = getattr(pool, "current", None)
         return current() if callable(current) else pool
 
+    @property
+    def in_transaction(self) -> bool:
+        """当前是否处于显式事务中（``begin()`` 后 ``commit()``/``rollback()`` 前）。
+
+        供 QuerySet.for_update() 的执行守卫使用：事务外的行锁要么瞬间
+        释放（autocommit）要么泄漏到回池连接，必须拒绝。
+        """
+        return getattr(self, "_tx_conn", None) is not None
+
     # ------------------------------------------------------------------
     # DDL 批处理
     # ------------------------------------------------------------------
@@ -258,6 +267,10 @@ class AbstractDialect(ABC):
         if query.offset_count is not None and not count and not exists:
             params.append(query.offset_count)
             sql = f"{sql} OFFSET {self.render_placeholder(len(params))}"
+        if query._for_update is not None and not count and not exists:
+            sql = f"{sql} FOR UPDATE"
+            if query._for_update:
+                sql = f"{sql} {query._for_update}"
         return sql, params
 
     def build_insert(self, instance: Model) -> tuple[str, list[Any]]:

@@ -688,3 +688,69 @@ def test_select_with_join_and_alias(session: Session) -> None:
     assert '"posts"."title" AS "post_title"' in sql
     assert 'INNER JOIN "posts"' in sql
     assert params == []
+
+
+# ---------------------------------------------------------------------------
+# for_update() — 行锁
+# ---------------------------------------------------------------------------
+
+
+def test_for_update_renders_lock_clause(session: Session) -> None:
+    """for_update() 应在语句末尾追加 FOR UPDATE。"""
+    sql, params = session.query(User).filter(col(User.id) == 1).for_update().build_sql()
+
+    assert sql.endswith('FOR UPDATE')
+    assert params == [1]
+
+
+def test_for_update_skip_locked_renders(session: Session) -> None:
+    """for_update(skip_locked=True) 应追加 FOR UPDATE SKIP LOCKED。"""
+    sql, params = (
+        session.query(User)
+        .filter(col(User.age) > 18)
+        .order_by(col(User.id))
+        .limit(1)
+        .for_update(skip_locked=True)
+        .build_sql()
+    )
+
+    assert sql.endswith("FOR UPDATE SKIP LOCKED")
+    assert params == [18, 1]
+
+
+def test_for_update_nowait_renders(session: Session) -> None:
+    """for_update(nowait=True) 应追加 FOR UPDATE NOWAIT。"""
+    sql, params = session.query(User).for_update(nowait=True).build_sql()
+
+    assert sql.endswith("FOR UPDATE NOWAIT")
+    assert params == []
+
+
+def test_for_update_mutually_exclusive(session: Session) -> None:
+    """skip_locked 与 nowait 互斥，组合应报错。"""
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        session.query(User).for_update(skip_locked=True, nowait=True)
+
+
+def test_for_update_does_not_mutate_original(session: Session) -> None:
+    """for_update() 应遵循不可变 clone 模式，不影响原 QuerySet。"""
+    base = session.query(User).filter(col(User.id) == 1)
+    locked = base.for_update(skip_locked=True)
+
+    base_sql, _ = base.build_sql()
+    locked_sql, _ = locked.build_sql()
+
+    assert not base_sql.endswith("FOR UPDATE")
+    assert locked_sql.endswith("FOR UPDATE SKIP LOCKED")
+
+
+def test_for_update_renders_after_offset(session: Session) -> None:
+    """锁子句应位于 LIMIT/OFFSET 之后。"""
+    sql, params = (
+        session.query(User).order_by(col(User.id)).limit(10).offset(20).for_update().build_sql()
+    )
+
+    assert sql.endswith("FOR UPDATE")
+    assert "OFFSET" in sql
+    assert sql.index("OFFSET") < sql.index("FOR UPDATE")
+    assert params == [10, 20]

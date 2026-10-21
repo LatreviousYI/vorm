@@ -15,6 +15,7 @@
 - **联合索引** — `Meta.indexes` 声明，`Field(index=True)` 简写，只增不删
 - **断连自动重连** — health_monitor 周期 ping 检测断连，自动重建连接池（指数退避重试），已创建的 Session 无缝切换到新池
 - **多表 JOIN** — 显式 ON 条件，`Row` 对象支持属性/字典双模式访问
+- **行锁** — `for_update()` / `for_update(skip_locked=True)` 悲观锁，事务外执行直接报错
 - **原生 SQL** — `execute_raw()` / `fetch_raw()` / `fetch_one_raw()` 绕过 ORM 直接执行
 
 ## 安装
@@ -316,6 +317,44 @@ async with session.transaction():
 # 健康检查
 ok = await session.dialect.ping()  # True → 连接正常
 ```
+
+#### 行锁（FOR UPDATE）
+
+`for_update()` 对查询读取的行加排他行锁（`SELECT ... FOR UPDATE`），锁持有到事务提交/回滚，用于"读到 → 写回"之间防止并发修改。**必须在事务内执行**——事务外执行直接 `RuntimeError`（autocommit 下锁瞬间释放等于没锁，非 autocommit 下锁泄漏到回池连接上无限期持有）。
+
+```python
+# 读-改-写：防止丢失更新
+async with session.transaction():
+    row = await (
+        session.query(Account)
+        .filter(col(Account.id) == 1)
+        .for_update()
+        .first()
+    )
+    row.balance -= 100
+    await session.save(row)
+    # 提交/回滚时锁释放
+
+# 任务队列：SKIP LOCKED 并发认领，各 worker 互不等待
+async with session.transaction():
+    msg = await (
+        session.query(Message)
+        .filter(Message.status == "pending")
+        .order_by(col(Message.id))
+        .limit(1)
+        .for_update(skip_locked=True)   # → FOR UPDATE SKIP LOCKED
+        .first()
+    )
+    if msg is not None:
+        msg.status = "processing"
+        await session.save(msg)
+    # 提交后行锁释放，status='processing' 对所有人可见
+```
+
+- `for_update(skip_locked=True)`：跳过其他事务锁定的行而不等待（MySQL 8.0+ / PostgreSQL 9.5+）
+- `for_update(nowait=True)`：遇到锁定的行立即报错而不等待；与 `skip_locked` 互斥
+- 与 `count()` / `exists()` / `update()` / `delete()` 组合会直接 `ValueError`（锁子句会被静默丢弃或 SQL 非法）
+- 事务要尽量短：锁持有时间 = 整个事务时间，别在持锁时做网络 I/O
 
 #### 连接池重连
 
