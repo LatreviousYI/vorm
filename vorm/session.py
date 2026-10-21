@@ -4,6 +4,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 
+from vorm.dialects.base import AbstractDialect
 from vorm.dialects.mysql import create_mysql_dialect
 from vorm.dialects.postgresql import create_postgresql_dialect
 from vorm.model import Model
@@ -11,7 +12,7 @@ from vorm.query import ModelT, QuerySet
 
 
 class Session:
-    def __init__(self, dialect: Any) -> None:
+    def __init__(self, dialect: AbstractDialect) -> None:
         self.dialect = dialect
 
     def query(self, model: type[ModelT]) -> QuerySet[ModelT]:

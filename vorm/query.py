@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json as _json_mod
 from dataclasses import dataclass
-from typing import Any, Generic, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Generic, TypeVar, cast
 
 from pydantic import BaseModel, TypeAdapter
 
@@ -10,6 +10,9 @@ from vorm.exceptions import DoesNotExist, MultipleObjectsReturned
 from vorm.expression import AliasedColumn, Column, Expression, OrderExpression
 from vorm.model import Model
 from vorm.row import Row
+
+if TYPE_CHECKING:
+    from vorm.session import Session
 
 ModelT = TypeVar("ModelT", bound=Model)
 SerializationModel = TypeVar("SerializationModel", bound=BaseModel)
@@ -25,7 +28,7 @@ class JoinInfo:
 
 
 class QuerySet(Generic[ModelT]):
-    def __init__(self, session: Any, model: type[ModelT]) -> None:
+    def __init__(self, session: Session, model: type[ModelT]) -> None:
         self.session = session
         self.model = model
         self.filters: list[Expression] = []
@@ -34,6 +37,7 @@ class QuerySet(Generic[ModelT]):
         self.offset_count: int | None = None
         self.joins: list[JoinInfo] = []
         self._selected: tuple[Column | AliasedColumn, ...] | None = None
+        self._for_update: str | None = None
 
     def _clone(self) -> QuerySet[ModelT]:
         clone = type(self)(self.session, self.model)
@@ -43,6 +47,7 @@ class QuerySet(Generic[ModelT]):
         clone.offset_count = self.offset_count
         clone.joins = [*self.joins]
         clone._selected = self._selected
+        clone._for_update = self._for_update
         return clone
 
     def filter(self, *exprs: Any) -> QuerySet[ModelT]:
@@ -68,6 +73,39 @@ class QuerySet(Generic[ModelT]):
             raise ValueError("offset must be a non-negative integer")
         clone = self._clone()
         clone.offset_count = count
+        return clone
+
+    def for_update(
+        self, skip_locked: bool = False, nowait: bool = False
+    ) -> QuerySet[ModelT]:
+        """对查询读取的行加排他行锁（``SELECT ... FOR UPDATE``）。
+
+        锁持有到事务提交/回滚，用于"读到 → 写回"之间防止并发修改。
+        **必须在事务内执行**（``async with session.transaction():``）——
+        事务外执行直接 raise：autocommit 下锁瞬间释放等于没锁，
+        非 autocommit 下锁泄漏到回池连接上无限期持有。
+
+        用法::
+
+            async with session.transaction():
+                row = await (
+                    session.query(Message)
+                    .filter(Message.status == "pending")
+                    .order_by(Message.id)
+                    .limit(1)
+                    .for_update(skip_locked=True)
+                    .first()
+                )
+
+        :param skip_locked: 追加 ``SKIP LOCKED``——跳过其他事务锁定的行而不等待，
+            适用于任务队列并发认领（MySQL 8.0+ / PostgreSQL 9.5+）
+        :param nowait: 追加 ``NOWAIT``——遇到锁定的行立即报错而不等待；
+            与 ``skip_locked`` 互斥
+        """
+        if skip_locked and nowait:
+            raise ValueError("skip_locked and nowait are mutually exclusive")
+        clone = self._clone()
+        clone._for_update = "SKIP LOCKED" if skip_locked else ("NOWAIT" if nowait else "")
         return clone
 
     def join(self, model: type[Model], *, on: Expression, type: str = "INNER") -> QuerySet[ModelT]:
@@ -103,24 +141,39 @@ class QuerySet(Generic[ModelT]):
         return clone
 
     def build_sql(self) -> tuple[str, list[Any]]:
-        return cast(tuple[str, list[Any]], self.session.dialect.build_select(self))
+        return self.session.dialect.build_select(self)
 
     # -- 执行 ---------------------------------------------------------------
 
     def _table_names(self) -> list[str]:
         return [self.model.__table__] + [j.model.__table__ for j in self.joins]
 
+    def _check_for_update_context(self) -> None:
+        """for_update() 的执行守卫：必须在显式事务内。
+
+        事务外的行锁要么瞬间释放（autocommit，等于没锁），要么随未结束
+        事务泄漏到回池连接上无限期持有——两者都直接报错。
+        """
+        if self._for_update is not None and not self.session.dialect.in_transaction:
+            raise RuntimeError(
+                "for_update() query must run inside a transaction "
+                "(async with session.transaction(): ...) — outside a transaction "
+                "row locks are released immediately (autocommit) or leak into "
+                "the connection pool"
+            )
+
     async def all(self) -> list[ModelT]:
+        self._check_for_update_context()
         sql, params = self.build_sql()
         rows = await self.session.dialect.fetch(sql, params)
 
         # select() 模式：直接返回数据库行字典
         if self._selected is not None:
-            return rows
+            return cast("list[ModelT]", rows)
 
         if self.joins:
             table_names = self._table_names()
-            return [Row(row, table_names) for row in rows]  # type: ignore[return-value]
+            return cast("list[ModelT]", [Row(row, table_names) for row in rows])
 
         # 将 JSON 字符串反序列化为 Python 对象再交给 Pydantic 校验
         json_fields = self.model.__json_fields__
@@ -148,11 +201,15 @@ class QuerySet(Generic[ModelT]):
         return rows[0]
 
     async def count(self) -> int:
+        if self._for_update is not None:
+            raise ValueError("for_update() cannot be combined with count()")
         sql, params = self.session.dialect.build_select(self, count=True)
         row = await self.session.dialect.fetchrow(sql, params)
         return int(row["count"]) if row is not None else 0
 
     async def exists(self) -> bool:
+        if self._for_update is not None:
+            raise ValueError("for_update() cannot be combined with exists()")
         sql, params = self.session.dialect.build_select(self, exists=True)
         return await self.session.dialect.fetchrow(sql, params) is not None
 
@@ -163,6 +220,11 @@ class QuerySet(Generic[ModelT]):
 
             row_count = await session.query(User).filter(User.age.is_null()).update(age=0)
         """
+        if self._for_update is not None:
+            raise ValueError(
+                "for_update() cannot be combined with update() — "
+                "lock rows first with all()/first(), then update"
+            )
         if not values:
             return 0
         sql, params = self.session.dialect.build_update_by_query(self, values)
@@ -176,6 +238,11 @@ class QuerySet(Generic[ModelT]):
 
             row_count = await session.query(User).filter(User.age < 18).delete()
         """
+        if self._for_update is not None:
+            raise ValueError(
+                "for_update() cannot be combined with delete() — "
+                "lock rows first with all()/first(), then delete"
+            )
         sql, params = self.session.dialect.build_delete_by_query(self)
         result = await self.session.dialect.execute(sql, params)
         return int(result) if result is not None else 0

@@ -13,8 +13,9 @@
 - **JSON 原生支持** — `dict`/`list` 自动映射 JSON/JSONB，默认值使用数据库原生函数
 - **时间戳行为** — `timestamp_behavior="create"|"update"|"both"` 控制自动时间戳
 - **联合索引** — `Meta.indexes` 声明，`Field(index=True)` 简写，只增不删
-- **断连自动重试** — 连接断开时自动重试 3 次（指数退避），非连接错误直接抛出
+- **断连自动重连** — health_monitor 周期 ping 检测断连，自动重建连接池（指数退避重试），已创建的 Session 无缝切换到新池
 - **多表 JOIN** — 显式 ON 条件，`Row` 对象支持属性/字典双模式访问
+- **行锁** — `for_update()` / `for_update(skip_locked=True)` 悲观锁，事务外执行直接报错
 - **原生 SQL** — `execute_raw()` / `fetch_raw()` / `fetch_one_raw()` 绕过 ORM 直接执行
 
 ## 安装
@@ -162,7 +163,8 @@ from vorm.engine import create_mysql_engine, create_postgresql_engine
 # MySQL 连接池（推荐）
 mysql_engine = await create_mysql_engine(
     host="127.0.0.1", port=3306, user="username",
-    password="password", database="test", minsize=10, maxsize=20
+    password="password", database="test", minsize=10, maxsize=20,
+    autocommit=True,  # MySQL 务必显式开启，原因见下方说明
 )
 session = mysql_engine.session()
 
@@ -175,6 +177,15 @@ session = postgresql_engine.session()
 ```
 
 应用关闭时调用 `await mysql_engine.close()` 或 `await postgresql_engine.close()` 释放连接池。
+
+> **重要：MySQL 连接务必传 `autocommit=True`**
+>
+> `asyncmy` 默认 `autocommit=False`（连接建立即执行 `SET AUTOCOMMIT = 0`）。此模式下 MySQL 服务器会为**包括 `SELECT` 在内的每条语句**隐式开启事务，事务持有 `REPEATABLE READ` 快照和已读表的元数据锁（MDL），直到 `COMMIT` / `ROLLBACK` 才释放。vorm 事务外的读查询（`query()`、`fetch_raw()`、`fetch_one_raw()`、`ping()`）归还连接前不会结束事务，连接会带着服务器端未结束的事务回到连接池被复用，后果是：
+>
+> - **过期读**：复用该连接的查询沿用旧事务快照，读不到其他连接已提交的最新数据，偶发且难复现
+> - **DDL 阻塞**：`sync_table()` 的 `ALTER TABLE` 会被未结束事务持有的 MDL 阻塞，且 MDL 队列公平排队，这张表上的所有后续查询跟着一起卡住
+>
+> 传 `autocommit=True` 后，事务外的语句执行完立即自动提交，上述问题不复存在。vorm 的事务（`session.transaction()`）通过显式 `BEGIN` 开启，与 `autocommit=True` 完全兼容，行为不变。
 
 ### 3. 建表 & 索引
 
@@ -306,6 +317,66 @@ async with session.transaction():
 # 健康检查
 ok = await session.dialect.ping()  # True → 连接正常
 ```
+
+#### 行锁（FOR UPDATE）
+
+`for_update()` 对查询读取的行加排他行锁（`SELECT ... FOR UPDATE`），锁持有到事务提交/回滚，用于"读到 → 写回"之间防止并发修改。**必须在事务内执行**——事务外执行直接 `RuntimeError`（autocommit 下锁瞬间释放等于没锁，非 autocommit 下锁泄漏到回池连接上无限期持有）。
+
+```python
+# 读-改-写：防止丢失更新
+async with session.transaction():
+    row = await (
+        session.query(Account)
+        .filter(col(Account.id) == 1)
+        .for_update()
+        .first()
+    )
+    row.balance -= 100
+    await session.save(row)
+    # 提交/回滚时锁释放
+
+# 任务队列：SKIP LOCKED 并发认领，各 worker 互不等待
+async with session.transaction():
+    msg = await (
+        session.query(Message)
+        .filter(Message.status == "pending")
+        .order_by(col(Message.id))
+        .limit(1)
+        .for_update(skip_locked=True)   # → FOR UPDATE SKIP LOCKED
+        .first()
+    )
+    if msg is not None:
+        msg.status = "processing"
+        await session.save(msg)
+    # 提交后行锁释放，status='processing' 对所有人可见
+```
+
+- `for_update(skip_locked=True)`：跳过其他事务锁定的行而不等待（MySQL 8.0+ / PostgreSQL 9.5+）
+- `for_update(nowait=True)`：遇到锁定的行立即报错而不等待；与 `skip_locked` 互斥
+- 与 `count()` / `exists()` / `update()` / `delete()` 组合会直接 `ValueError`（锁子句会被静默丢弃或 SQL 非法）
+- 事务要尽量短：锁持有时间 = 整个事务时间，别在持锁时做网络 I/O
+
+#### 连接池重连
+
+断连后 `reconnect()` 会关闭旧连接池，并用**创建引擎时的同一份连接参数**（host/port/user/password 等）重建连接池。建池失败自动指数退避重试（默认 3 次：0.5s → 1s → 2s），全部失败返回 `False`。
+
+```python
+import asyncio
+
+# 方式一：后台健康监控，断连自动重连（推荐）
+asyncio.create_task(engine.health_monitor(interval=10))
+
+# 方式二：手动重连（可自定义重试次数与退避基数）
+ok = await engine.reconnect()                          # retries=3, backoff=0.5
+ok = await engine.reconnect(retries=5, backoff=1.0)    # 最多 5 次：1s → 2s → 4s → 8s → 16s
+
+# 重连成功后，已创建的 Session 自动切换到新池，无需重建：
+session = engine.session()
+await engine.reconnect()
+await session.execute_raw("SELECT 1", [])  # 走的是新池，正常工作
+```
+
+> **注意**：重连使用引擎创建时固化的连接参数，**不支持密码轮换**——若服务器侧修改了密码，重连会一直失败，只能用新凭据重建 Engine。需要每次重连时重新读取凭据（如 IAM 令牌、轮换密码），可通过底层 `Engine` 构造函数注入自定义 `factory`。
 
 ### 8. 原生 SQL
 

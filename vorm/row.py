@@ -8,6 +8,8 @@ class RowSnapshot:
 
     __slots__ = ("_fields",)
 
+    _fields: dict[str, Any]
+
     def __init__(self, fields: dict[str, Any]) -> None:
         object.__setattr__(self, "_fields", fields)
 
@@ -33,6 +35,9 @@ class Row:
     """
 
     __slots__ = ("_raw", "_tables")
+
+    _raw: dict[str, Any]
+    _tables: dict[str, dict[str, Any]]
 
     def __init__(self, raw: dict[str, Any], table_names: list[str]) -> None:
         object.__setattr__(self, "_raw", raw)

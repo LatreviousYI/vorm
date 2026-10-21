@@ -11,8 +11,9 @@
 - **Native JSON support** — `dict`/`list` automatically map to JSON/JSONB; defaults use database-native functions
 - **Timestamp behaviors** — `timestamp_behavior="create"|"update"|"both"` controls automatic timestamp handling
 - **Index management** — `Meta.indexes` for composite indexes, `Field(index=True)` for single-column. Additive only
-- **Auto-reconnect** — Automatic retry with exponential backoff on connection loss
+- **Auto-reconnect** — periodic health checks detect connection loss and rebuild the pool automatically (retried with exponential backoff); existing sessions switch to the new pool transparently
 - **Multi-table JOIN** — Explicit ON conditions with `Row` objects supporting both attribute and dictionary access
+- **Row locking** — `for_update()` / `for_update(skip_locked=True)` pessimistic locks; executing outside a transaction raises immediately
 - **Raw SQL** — `execute_raw()` / `fetch_raw()` / `fetch_one_raw()` to bypass the ORM when needed
 - **Enum support** — Python `enum.Enum` subclasses map to PostgreSQL custom enum types or MySQL inline `ENUM(...)`
 
@@ -161,7 +162,8 @@ from vorm.engine import create_mysql_engine, create_postgresql_engine
 # MySQL connection pool (recommended)
 mysql_engine = await create_mysql_engine(
     host="127.0.0.1", port=3306, user="username",
-    password="password", database="test", minsize=10, maxsize=20
+    password="password", database="test", minsize=10, maxsize=20,
+    autocommit=True,  # Required for MySQL — see note below
 )
 session = mysql_engine.session()
 
@@ -172,6 +174,15 @@ pg_engine = await create_postgresql_engine(
 )
 session = pg_engine.session()
 ```
+
+> **Important: always pass `autocommit=True` for MySQL**
+>
+> `asyncmy` defaults to `autocommit=False` (`SET AUTOCOMMIT = 0` on connect). In this mode the MySQL server implicitly opens a transaction for **every statement, including `SELECT`**. That transaction holds a `REPEATABLE READ` snapshot plus metadata locks (MDL) on the tables it read until `COMMIT` / `ROLLBACK`. vorm's read queries outside explicit transactions (`query()`, `fetch_raw()`, `fetch_one_raw()`, `ping()`) return the connection to the pool without ending the transaction, so the connection is reused with an open server-side transaction. Consequences:
+>
+> - **Stale reads**: queries reusing that connection keep reading the old snapshot and miss data committed by other connections — intermittent and hard to reproduce
+> - **DDL blocking**: `ALTER TABLE` from `sync_table()` blocks on the MDL held by the open transaction, and since the MDL queue is fair, every subsequent query on that table queues behind it
+>
+> With `autocommit=True`, statements outside transactions commit immediately and none of this can happen. vorm transactions (`session.transaction()`) start with an explicit `BEGIN`, fully compatible with `autocommit=True` — their behavior is unchanged.
 
 ### 3. Create Tables & Indexes
 
@@ -304,11 +315,68 @@ async with session.transaction():
 
 # Health check
 ok = await session.dialect.ping()  # True → connection is healthy
-
-# Background health monitor (auto-reconnect)
-import asyncio
-asyncio.create_task(engine.health_monitor(interval=10))
 ```
+
+#### Row Locking (FOR UPDATE)
+
+`for_update()` takes exclusive row locks on the rows read (`SELECT ... FOR UPDATE`). Locks are held until the transaction commits or rolls back — use it to prevent lost updates between "read" and "write back". **Must run inside a transaction** — executing outside one raises `RuntimeError` immediately (under autocommit the lock is released the instant it is taken, i.e. no lock at all; without autocommit the lock leaks onto the pooled connection and is held indefinitely).
+
+```python
+# Read-modify-write: prevent lost updates
+async with session.transaction():
+    row = await (
+        session.query(Account)
+        .filter(col(Account.id) == 1)
+        .for_update()
+        .first()
+    )
+    row.balance -= 100
+    await session.save(row)
+    # Lock released on commit/rollback
+
+# Task queue: concurrent claiming with SKIP LOCKED, workers never wait on each other
+async with session.transaction():
+    msg = await (
+        session.query(Message)
+        .filter(Message.status == "pending")
+        .order_by(col(Message.id))
+        .limit(1)
+        .for_update(skip_locked=True)   # → FOR UPDATE SKIP LOCKED
+        .first()
+    )
+    if msg is not None:
+        msg.status = "processing"
+        await session.save(msg)
+    # On commit the row lock is released and status='processing' is visible to everyone
+```
+
+- `for_update(skip_locked=True)`: skip rows locked by other transactions instead of waiting (MySQL 8.0+ / PostgreSQL 9.5+)
+- `for_update(nowait=True)`: raise an error immediately on locked rows instead of waiting; mutually exclusive with `skip_locked`
+- Combining with `count()` / `exists()` / `update()` / `delete()` raises `ValueError` (the lock clause would be silently dropped or the SQL is invalid)
+- Keep transactions short: lock hold time = the whole transaction — never do network I/O while holding locks
+
+#### Pool Reconnection
+
+On connection loss, `reconnect()` closes the old pool and rebuilds it with the **same connection parameters captured at engine creation** (host/port/user/password, etc.). Failed pool creation is retried automatically with exponential backoff (3 attempts by default: 0.5s → 1s → 2s); it returns `False` once all retries are exhausted.
+
+```python
+import asyncio
+
+# Option 1: background health monitor with auto-reconnect (recommended)
+asyncio.create_task(engine.health_monitor(interval=10))
+
+# Option 2: manual reconnect (configurable retries and backoff base)
+ok = await engine.reconnect()                        # retries=3, backoff=0.5
+ok = await engine.reconnect(retries=5, backoff=1.0)  # up to 5 attempts: 1s → 2s → 4s → 8s → 16s
+
+# After a successful reconnect, existing sessions switch to the new
+# pool automatically — no need to rebuild them:
+session = engine.session()
+await engine.reconnect()
+await session.execute_raw("SELECT 1", [])  # runs on the new pool
+```
+
+> **Note**: reconnection uses the credentials fixed at engine creation — **password rotation is not supported**. If the password changes server-side, reconnect keeps failing until you build a new Engine with fresh credentials. To re-read credentials on every reconnect (e.g., IAM tokens, rotating passwords), inject a custom `factory` via the low-level `Engine` constructor.
 
 ### 8. Raw SQL
 

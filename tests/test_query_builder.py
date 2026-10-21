@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import datetime
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -68,8 +68,8 @@ def session() -> Session:
 def test_build_select_with_filters_order_limit_offset(session: Session) -> None:
     query = (
         session.query(User)
-        .filter(User.age > 18, User.name != "Bob")
-        .order_by(User.name.desc())
+        .filter(col(User.age) > 18, col(User.name) != "Bob")
+        .order_by(col(User.name).desc())
         .limit(10)
         .offset(20)
     )
@@ -133,7 +133,7 @@ def test_build_update_uses_primary_key_in_where(session: Session) -> None:
 
 
 def test_in_empty_renders_false_condition(session: Session) -> None:
-    sql, params = session.query(User).filter(User.id.in_([])).build_sql()
+    sql, params = session.query(User).filter(col(User.id).in_([])).build_sql()
 
     assert sql == 'SELECT "users"."id", "users"."name", "users"."age" FROM "users" WHERE 1 = 0'
     assert params == []
@@ -151,7 +151,7 @@ def test_build_bulk_insert(session: Session) -> None:
         User(name="Charlie", age=None),
     ]
 
-    sql, params = session.dialect.build_bulk_insert(users)
+    sql, params = session.dialect.build_bulk_insert(cast("list[Model]", users))
 
     assert sql == ('INSERT INTO "users" ("name", "age") VALUES ($1, $2), ($3, $4), ($5, $6)')
     assert params == ["Alice", 25, "Bob", 30, "Charlie", None]
@@ -168,7 +168,7 @@ def test_build_bulk_insert_empty_raises(session: Session) -> None:
 
 
 def test_build_update_by_query(session: Session) -> None:
-    query = session.query(User).filter(User.age.is_null())
+    query = session.query(User).filter(col(User.age).is_null())
 
     sql, params = session.dialect.build_update_by_query(query, {"age": 0, "name": "unknown"})
 
@@ -192,7 +192,7 @@ def test_build_update_by_query_no_filter(session: Session) -> None:
 
 
 def test_build_delete_by_query(session: Session) -> None:
-    query = session.query(User).filter(User.age < 18)
+    query = session.query(User).filter(col(User.age) < 18)
 
     sql, params = session.dialect.build_delete_by_query(query)
 
@@ -219,7 +219,7 @@ def test_pg_build_insert_includes_returning() -> None:
     """PostgreSQL 的 build_insert 应在语句末尾追加 RETURNING 主键列。"""
     from vorm.dialects.postgresql import PostgreSQLDialect
 
-    dialect = PostgreSQLDialect(pool=None)  # type: ignore[arg-type]  # 仅测 SQL 生成，不连库
+    dialect = PostgreSQLDialect(pool=None)
     user = User(name="Alice", age=25)
 
     sql, params = dialect.build_insert(user)
@@ -340,7 +340,7 @@ class Comment(Model):
 
 def test_join_single_join_generates_correct_sql(session: Session) -> None:
     """单个 INNER JOIN 应产生正确的 SELECT + JOIN 语句。"""
-    sql, params = session.query(User).join(Post, on=User.id == Post.user_id).build_sql()
+    sql, params = session.query(User).join(Post, on=col(User.id) == col(Post.user_id)).build_sql()
 
     # aliases "users_id", "posts_id" 需要转义
     assert sql == (
@@ -358,8 +358,8 @@ def test_join_two_joins_three_tables(session: Session) -> None:
     """三表 JOIN（User → Post → Comment）。"""
     sql, params = (
         session.query(User)
-        .join(Post, on=User.id == Post.user_id)
-        .join(Comment, on=Post.id == Comment.post_id)
+        .join(Post, on=col(User.id) == col(Post.user_id))
+        .join(Comment, on=col(Post.id) == col(Comment.post_id))
         .build_sql()
     )
 
@@ -375,9 +375,9 @@ def test_join_with_filter_and_order(session: Session) -> None:
     """JOIN + filter + order_by 的组合。"""
     sql, params = (
         session.query(User)
-        .join(Post, on=User.id == Post.user_id)
-        .filter(Post.title == "Hello")
-        .order_by(User.name.asc())
+        .join(Post, on=col(User.id) == col(Post.user_id))
+        .filter(col(Post.title) == "Hello")
+        .order_by(col(User.name).asc())
         .build_sql()
     )
 
@@ -390,7 +390,9 @@ def test_join_with_filter_and_order(session: Session) -> None:
 def test_join_left_join(session: Session) -> None:
     """LEFT JOIN 应在 SQL 中出现 LEFT JOIN 关键字。"""
     sql, params = (
-        session.query(User).join(Post, on=User.id == Post.user_id, type="LEFT").build_sql()
+        session.query(User)
+        .join(Post, on=col(User.id) == col(Post.user_id), type="LEFT")
+        .build_sql()
     )
 
     assert 'LEFT JOIN "posts" ON "users"."id" = "posts"."user_id"' in sql
@@ -399,20 +401,22 @@ def test_join_left_join(session: Session) -> None:
 
 def test_join_rejects_unsupported_type(session: Session) -> None:
     with pytest.raises(ValueError, match="join type must be 'INNER' or 'LEFT'"):
-        session.query(User).join(Post, on=User.id == Post.user_id, type="RIGHT")
+        session.query(User).join(Post, on=col(User.id) == col(Post.user_id), type="RIGHT")
 
 
 def test_join_count(session: Session) -> None:
     """带 JOIN 的 COUNT 应包含 JOIN 子句。"""
     sql, params = (
         session.query(User)
-        .join(Post, on=User.id == Post.user_id)
-        .filter(Post.title == "X")
+        .join(Post, on=col(User.id) == col(Post.user_id))
+        .filter(col(Post.title) == "X")
         .build_sql()
     )
     # count 通过 build_select(count=True) 调用，模拟一下
     sql_count, _ = session.dialect.build_select(
-        session.query(User).join(Post, on=User.id == Post.user_id).filter(Post.title == "X"),
+        session.query(User)
+        .join(Post, on=col(User.id) == col(Post.user_id))
+        .filter(col(Post.title) == "X"),
         count=True,
     )
 
@@ -428,7 +432,7 @@ def test_join_count(session: Session) -> None:
 
 def test_like_expression(session: Session) -> None:
     """Column.like() 应生成 LIKE 表达式。"""
-    sql, params = session.query(User).filter(User.name.like("A%")).build_sql()
+    sql, params = session.query(User).filter(col(User.name).like("A%")).build_sql()
 
     assert '"users"."name" LIKE $1' in sql
     assert params == ["A%"]
@@ -436,7 +440,9 @@ def test_like_expression(session: Session) -> None:
 
 def test_like_with_multiple_filters(session: Session) -> None:
     """LIKE 可以与其他 filter 组合使用。"""
-    sql, params = session.query(User).filter(User.name.like("%lice%"), User.age > 18).build_sql()
+    sql, params = (
+        session.query(User).filter(col(User.name).like("%lice%"), col(User.age) > 18).build_sql()
+    )
 
     assert "LIKE $1" in sql
     assert ">" in sql
@@ -445,7 +451,7 @@ def test_like_with_multiple_filters(session: Session) -> None:
 
 def test_between_expression(session: Session) -> None:
     """Column.between() 应生成 BETWEEN ... AND ... 表达式。"""
-    sql, params = session.query(User).filter(User.age.between(18, 65)).build_sql()
+    sql, params = session.query(User).filter(col(User.age).between(18, 65)).build_sql()
 
     assert '"users"."age" BETWEEN $1 AND $2' in sql
     assert params == [18, 65]
@@ -454,7 +460,10 @@ def test_between_expression(session: Session) -> None:
 def test_between_with_order(session: Session) -> None:
     """BETWEEN 可以与 ORDER BY 组合。"""
     sql, params = (
-        session.query(User).filter(User.age.between(20, 30)).order_by(User.name.asc()).build_sql()
+        session.query(User)
+        .filter(col(User.age).between(20, 30))
+        .order_by(col(User.name).asc())
+        .build_sql()
     )
 
     assert "BETWEEN $1 AND $2" in sql
@@ -465,7 +474,9 @@ def test_between_with_order(session: Session) -> None:
 def test_like_and_between_combined(session: Session) -> None:
     """LIKE 和 BETWEEN 可以同时使用。"""
     sql, params = (
-        session.query(User).filter(User.name.like("A%"), User.age.between(25, 50)).build_sql()
+        session.query(User)
+        .filter(col(User.name).like("A%"), col(User.age).between(25, 50))
+        .build_sql()
     )
 
     assert "LIKE $1" in sql
@@ -485,13 +496,13 @@ class Product(Model):
         table = "products"
 
     id: int = Field(primary_key=True, auto_increment=True)
-    data: dict  # → JSON/JSONB
+    data: dict[str, Any]  # → JSON/JSONB
 
 
 def test_json_path_eq(session: Session) -> None:
     """json_path + == 应生成 column->>'$.key' = $1 参数化查询。"""
     sql, params = (
-        session.query(Product).filter(Product.data.json_path("$.name") == "Alice").build_sql()
+        session.query(Product).filter(col(Product.data).json_path("$.name") == "Alice").build_sql()
     )
 
     assert "->>" in sql
@@ -504,7 +515,7 @@ def test_json_path_gt(session: Session) -> None:
     """json_path 比较运算符应生效。"""
     sql, params = (
         session.query(Product)
-        .filter(Product.data.json_path("$.price", as_text=False) > 100)
+        .filter(col(Product.data).json_path("$.price", as_text=False) > 100)
         .build_sql()
     )
 
@@ -519,8 +530,8 @@ def test_json_path_multiple_filters(session: Session) -> None:
     sql, params = (
         session.query(Product)
         .filter(
-            Product.data.json_path("$.category") == "book",
-            Product.data.json_path("$.price") > 50,
+            col(Product.data).json_path("$.category") == "book",
+            col(Product.data).json_path("$.price") > 50,
         )
         .build_sql()
     )
@@ -613,7 +624,7 @@ def test_build_insert_omits_database_timestamps(session: Session) -> None:
 
 def test_select_columns_basic(session: Session) -> None:
     """select() 指定列时应只生成对应列，不含其他列。"""
-    sql, params = session.query(User).select(User.id, User.name).build_sql()
+    sql, params = session.query(User).select(col(User.id), col(User.name)).build_sql()
 
     assert '"users"."id"' in sql
     assert '"users"."name"' in sql
@@ -626,7 +637,7 @@ def test_select_columns_with_alias(session: Session) -> None:
     """select() 加 alias 应生成 AS 子句。"""
     sql, params = (
         session.query(User)
-        .select(User.id.alias("user_id"), User.name.alias("user_name"))
+        .select(col(User.id).alias("user_id"), col(User.name).alias("user_name"))
         .build_sql()
     )
 
@@ -637,7 +648,12 @@ def test_select_columns_with_alias(session: Session) -> None:
 
 def test_select_with_filter(session: Session) -> None:
     """select() 可以与 filter 组合使用。"""
-    sql, params = session.query(User).select(User.id, User.name).filter(User.age > 18).build_sql()
+    sql, params = (
+        session.query(User)
+        .select(col(User.id), col(User.name))
+        .filter(col(User.age) > 18)
+        .build_sql()
+    )
 
     assert '"users"."id"' in sql
     assert '"users"."name"' in sql
@@ -658,11 +674,11 @@ def test_select_with_join_and_alias(session: Session) -> None:
 
     sql, params = (
         session.query(User)
-        .join(Post, on=User.id == Post.user_id)
+        .join(Post, on=col(User.id) == col(Post.user_id))
         .select(
-            User.id.alias("user_id"),
-            User.name.alias("user_name"),
-            Post.title.alias("post_title"),
+            col(User.id).alias("user_id"),
+            col(User.name).alias("user_name"),
+            col(Post.title).alias("post_title"),
         )
         .build_sql()
     )
@@ -672,3 +688,69 @@ def test_select_with_join_and_alias(session: Session) -> None:
     assert '"posts"."title" AS "post_title"' in sql
     assert 'INNER JOIN "posts"' in sql
     assert params == []
+
+
+# ---------------------------------------------------------------------------
+# for_update() — 行锁
+# ---------------------------------------------------------------------------
+
+
+def test_for_update_renders_lock_clause(session: Session) -> None:
+    """for_update() 应在语句末尾追加 FOR UPDATE。"""
+    sql, params = session.query(User).filter(col(User.id) == 1).for_update().build_sql()
+
+    assert sql.endswith('FOR UPDATE')
+    assert params == [1]
+
+
+def test_for_update_skip_locked_renders(session: Session) -> None:
+    """for_update(skip_locked=True) 应追加 FOR UPDATE SKIP LOCKED。"""
+    sql, params = (
+        session.query(User)
+        .filter(col(User.age) > 18)
+        .order_by(col(User.id))
+        .limit(1)
+        .for_update(skip_locked=True)
+        .build_sql()
+    )
+
+    assert sql.endswith("FOR UPDATE SKIP LOCKED")
+    assert params == [18, 1]
+
+
+def test_for_update_nowait_renders(session: Session) -> None:
+    """for_update(nowait=True) 应追加 FOR UPDATE NOWAIT。"""
+    sql, params = session.query(User).for_update(nowait=True).build_sql()
+
+    assert sql.endswith("FOR UPDATE NOWAIT")
+    assert params == []
+
+
+def test_for_update_mutually_exclusive(session: Session) -> None:
+    """skip_locked 与 nowait 互斥，组合应报错。"""
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        session.query(User).for_update(skip_locked=True, nowait=True)
+
+
+def test_for_update_does_not_mutate_original(session: Session) -> None:
+    """for_update() 应遵循不可变 clone 模式，不影响原 QuerySet。"""
+    base = session.query(User).filter(col(User.id) == 1)
+    locked = base.for_update(skip_locked=True)
+
+    base_sql, _ = base.build_sql()
+    locked_sql, _ = locked.build_sql()
+
+    assert not base_sql.endswith("FOR UPDATE")
+    assert locked_sql.endswith("FOR UPDATE SKIP LOCKED")
+
+
+def test_for_update_renders_after_offset(session: Session) -> None:
+    """锁子句应位于 LIMIT/OFFSET 之后。"""
+    sql, params = (
+        session.query(User).order_by(col(User.id)).limit(10).offset(20).for_update().build_sql()
+    )
+
+    assert sql.endswith("FOR UPDATE")
+    assert "OFFSET" in sql
+    assert sql.index("OFFSET") < sql.index("FOR UPDATE")
+    assert params == [10, 20]
