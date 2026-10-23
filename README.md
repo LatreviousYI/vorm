@@ -16,6 +16,7 @@
 - **断连自动重连** — health_monitor 周期 ping 检测断连，自动重建连接池（指数退避重试），已创建的 Session 无缝切换到新池
 - **多表 JOIN** — 显式 ON 条件，`Row` 对象支持属性/字典双模式访问
 - **行锁** — `for_update()` / `for_update(skip_locked=True)` 悲观锁，事务外执行直接报错
+- **嵌套事务** — `transaction()` 可嵌套，内层自动改用 `SAVEPOINT`，内层回滚不影响外层
 - **原生 SQL** — `execute_raw()` / `fetch_raw()` / `fetch_one_raw()` 绕过 ORM 直接执行
 
 ## 安装
@@ -314,6 +315,17 @@ async with session.transaction():
     await session.save(bob)
     # 异常自动回滚，正常自动提交
 
+# 嵌套事务（自动使用 SAVEPOINT，仅内层回滚）
+async with session.transaction():
+    await session.save(alice)
+    try:
+        async with session.transaction():
+            await session.save(bob)
+            raise RuntimeError("只撤销 bob")
+    except RuntimeError:
+        pass
+    # alice 仍在事务中，可继续提交
+
 # 健康检查
 ok = await session.dialect.ping()  # True → 连接正常
 ```
@@ -385,6 +397,99 @@ await session.execute_raw("DELETE FROM users WHERE status = %s", ["inactive"])
 rows = await session.fetch_raw("SELECT id, name FROM users WHERE age > %s", [18])
 row = await session.fetch_one_raw("SELECT * FROM users WHERE id = %s", [1])
 ```
+
+#### 返回值
+
+| 方法 | 返回类型 | 说明 |
+|---|---|---|
+| `execute_raw(sql, params=None)` | `int` | 写操作返回受影响行数；DDL 返回 `0`。**不返回 `lastrowid`**，需要自增主键请用 `save()` |
+| `fetch_raw(sql, params=None)` | `list[dict[str, Any]]` | 无结果时返回 `[]` |
+| `fetch_one_raw(sql, params=None)` | `dict[str, Any]` 或 `None` | 无结果时返回 `None` |
+
+`params` 必须按 SQL 中占位符的顺序传 `list`（不是 tuple/dict），省略等价于 `[]`。
+
+> `execute_raw()` 只用于写操作。对 `SELECT` 也能跑，但返回值没有稳定语义（MySQL 返回结果行数，PostgreSQL 从状态串解析），读数据请用 `fetch_raw()` / `fetch_one_raw()`。
+
+#### 行是驱动的原始字典，不是模型、也不是 `Row`
+
+```python
+rows = await session.fetch_raw("SELECT id, name FROM users WHERE age > %s", [18])
+# [{"id": 1, "name": "alice"}, {"id": 2, "name": "bob"}]
+
+rows[0]["name"]   # 只支持字典访问
+rows[0].name      # ✗ AttributeError —— 属性访问是 join() 返回的 Row 才有的
+```
+
+- **key 就是 SQL 里的列标签**，不做模型字段映射（`SELECT id AS user_id` → key 为 `user_id`）
+- **列名重复要自己取别名**：`SELECT 1 AS a, 2 AS a` 在 MySQL 被驱动改名为 `{"a": 1, ".a": 2}`，在 PostgreSQL 则后者覆盖前者 `{"a": 2}`。JOIN 查询请写成 `a.id AS a_id, b.id AS b_id`
+- 返回的是 `dict`，可直接 `json.dumps`、`dict(row)`、`**row`
+
+#### 占位符与方言绑定
+
+vorm 不会改写原生 SQL，因此占位符必须匹配当前数据库：
+
+```python
+# MySQL
+await session.fetch_raw("SELECT * FROM users WHERE id = %s", [1])
+# PostgreSQL
+await session.fetch_raw("SELECT * FROM users WHERE id = $1", [1])
+```
+
+同一条 SQL 不能跨库复用；确实要跨库时可用 `session.dialect.render_placeholder(1)` 生成（MySQL → `%s`，PostgreSQL → `$1`）。
+
+#### 类型是驱动的原样返回值
+
+ORM 的 `query()` 会把 JSON 列反序列化为 `dict`/`list` 并做 Pydantic 校验，**原生 SQL 全部跳过**，值保持驱动返回的原始类型：
+
+| SQL 类型 | MySQL (`asyncmy`) | PostgreSQL (`asyncpg`) |
+|---|---|---|
+| `INT` / `BIGINT` | `int` | `int` |
+| `FLOAT` / `DOUBLE` | `float` | `float` |
+| `DECIMAL` / `NUMERIC` | `Decimal` | `Decimal` |
+| `BOOL` / `TINYINT(1)` | `int`（`0` / `1`） | `bool` |
+| `DATE` | `date` | `date` |
+| `DATETIME` / `TIMESTAMP` | `datetime`（无时区） | `datetime`（`timestamptz` 带 `tzinfo`，UTC） |
+| `TIME` | `timedelta` | `time` |
+| `INTERVAL` | — | `timedelta` |
+| `BLOB` / `BYTEA` | `bytes` | `bytes` |
+| `JSON` / `JSONB` | `str`（原始文本） | `str`（原始文本） |
+| `ENUM` | `str` | `str` |
+
+两个容易踩的点：**JSON 列拿到的是字符串**，要自己 `json.loads()`；**MySQL 的 `BOOL` 是 `0`/`1` 的 `int`**，不是 `True`/`False`。
+
+```python
+import json
+
+rows = await session.fetch_raw("SELECT id, config FROM articles", [])
+articles = [{"id": r["id"], "config": json.loads(r["config"])} for r in rows]
+```
+
+#### 转成模型对象
+
+需要模型实例时，可以先把行交给 Pydantic（JSON 列记得先 `loads`），或者直接用 `query()`：
+
+```python
+from pydantic import TypeAdapter
+
+rows = await session.fetch_raw("SELECT id, name, age FROM users", [])
+users = TypeAdapter(list[User]).validate_python(rows)   # 字段名/类型需与列标签一致
+
+# 等价且更省事：走 ORM，返回 list[User]
+users = await session.query(User).all()
+```
+
+#### 与事务共享连接
+
+原生 SQL 和 ORM 走同一个 Session/dialect，在事务内执行的 raw SQL 参与同一事务，异常时一起回滚：
+
+```python
+async with session.transaction():
+    await session.execute_raw("UPDATE accounts SET balance = balance - %s WHERE id = %s", [100, 1])
+    await session.execute_raw("UPDATE accounts SET balance = balance + %s WHERE id = %s", [100, 2])
+```
+
+> `for_update()` 那类需要显式事务的保护只作用于查询构造器；自己手写的 `SELECT ... FOR UPDATE` 请自行确保在 `session.transaction()` 内。
+
 ## 查看日志
 ```
 import logging

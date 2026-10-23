@@ -4,6 +4,8 @@ import enum
 import json as _json_mod
 import re
 from abc import ABC, abstractmethod
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any
 
 from vorm.fields import ColumnInfo, get_column_info
@@ -105,6 +107,39 @@ class AbstractDialect(ABC):
     async def rollback(self) -> None:
         """回滚事务。"""
         raise NotImplementedError
+
+    @asynccontextmanager
+    async def savepoint(self) -> AsyncIterator[str]:
+        """在当前事务内创建保存点，用于实现嵌套事务。
+
+        - 正常退出 → ``RELEASE SAVEPOINT``，内层改动保留在外层事务中
+        - 抛异常 → ``ROLLBACK TO SAVEPOINT`` 后释放，只撤销内层改动，
+          外层事务仍可继续提交或回滚
+
+        保存点只在显式事务内有效，事务外调用直接 ``RuntimeError``。
+        注意：MySQL 的 DDL / ``LOCK TABLES`` 等语句会隐式提交事务并销毁
+        所有保存点，此类语句之后的保存点不再可用。
+        """
+        if not self.in_transaction:
+            raise RuntimeError("savepoint() requires a transaction in progress")
+
+        name = self._next_savepoint_name()
+        quoted = self.quote_identifier(name)
+        await self.execute(f"SAVEPOINT {quoted}", [])
+        try:
+            yield name
+        except BaseException:
+            await self.execute(f"ROLLBACK TO SAVEPOINT {quoted}", [])
+            await self.execute(f"RELEASE SAVEPOINT {quoted}", [])
+            raise
+        else:
+            await self.execute(f"RELEASE SAVEPOINT {quoted}", [])
+
+    def _next_savepoint_name(self) -> str:
+        """生成同一 dialect 实例内单调递增、互不重名的保存点名。"""
+        seq = getattr(self, "_savepoint_seq", 0)
+        self._savepoint_seq = seq + 1
+        return f"vorm_sp_{seq}"
 
     # ------------------------------------------------------------------
     # 执行

@@ -171,6 +171,120 @@ async def test_session_transaction_rolls_back_on_cancellation() -> None:
 
 
 # ---------------------------------------------------------------------------
+# 嵌套事务（SAVEPOINT）
+# ---------------------------------------------------------------------------
+
+
+class _RecordingTxnDialect(_TestDialect):
+    """记录事务相关 SQL 的 dialect，用于验证嵌套事务行为。"""
+
+    def __init__(self) -> None:
+        super().__init__(object())
+        self._tx_conn: Any = None
+        self.sql: list[str] = []
+
+    async def begin(self) -> None:
+        self._tx_conn = object()
+        self.sql.append("BEGIN")
+
+    async def commit(self) -> None:
+        self._tx_conn = None
+        self.sql.append("COMMIT")
+
+    async def rollback(self) -> None:
+        self._tx_conn = None
+        self.sql.append("ROLLBACK")
+
+    async def execute(self, sql: str, params: list[Any]) -> Any:
+        self.sql.append(sql)
+        return None
+
+
+async def test_nested_transaction_uses_savepoint() -> None:
+    """嵌套 transaction() 内层应使用 SAVEPOINT / RELEASE，而非再次 BEGIN。"""
+    dialect = _RecordingTxnDialect()
+    session = Session(dialect)
+
+    async with session.transaction():
+        async with session.transaction():
+            pass
+
+    assert dialect.sql == [
+        "BEGIN",
+        'SAVEPOINT "vorm_sp_0"',
+        'RELEASE SAVEPOINT "vorm_sp_0"',
+        "COMMIT",
+    ]
+
+
+async def test_nested_transaction_rolls_back_to_savepoint() -> None:
+    """内层异常只回滚到保存点，外层事务照常提交。"""
+
+    class InnerError(Exception):
+        pass
+
+    dialect = _RecordingTxnDialect()
+    session = Session(dialect)
+
+    async with session.transaction():
+        with pytest.raises(InnerError):
+            async with session.transaction():
+                raise InnerError("内层失败")
+
+    assert dialect.sql == [
+        "BEGIN",
+        'SAVEPOINT "vorm_sp_0"',
+        'ROLLBACK TO SAVEPOINT "vorm_sp_0"',
+        'RELEASE SAVEPOINT "vorm_sp_0"',
+        "COMMIT",
+    ]
+
+
+async def test_outer_exception_rolls_back_whole_transaction() -> None:
+    """内层已正常退出，外层抛异常仍需回滚整个事务（不提交）。"""
+
+    class OuterError(Exception):
+        pass
+
+    dialect = _RecordingTxnDialect()
+    session = Session(dialect)
+
+    with pytest.raises(OuterError):
+        async with session.transaction():
+            async with session.transaction():
+                pass
+            raise OuterError("外层失败")
+
+    assert "COMMIT" not in dialect.sql
+    assert dialect.sql[-1] == "ROLLBACK"
+
+
+async def test_deeply_nested_transactions_get_unique_savepoints() -> None:
+    """多层嵌套每层一个独立保存点，名字不重复。"""
+    dialect = _RecordingTxnDialect()
+    session = Session(dialect)
+
+    async with session.transaction():
+        async with session.transaction():
+            async with session.transaction():
+                pass
+
+    savepoints = [sql for sql in dialect.sql if sql.startswith("SAVEPOINT")]
+    assert savepoints == ['SAVEPOINT "vorm_sp_0"', 'SAVEPOINT "vorm_sp_1"']
+
+
+async def test_savepoint_outside_transaction_raises() -> None:
+    """事务外创建保存点直接报错。"""
+    dialect = _RecordingTxnDialect()
+
+    with pytest.raises(RuntimeError, match="transaction in progress"):
+        async with dialect.savepoint():
+            pass
+
+    assert dialect.sql == []
+
+
+# ---------------------------------------------------------------------------
 # 独立 dialect close（_owns_pool=True）
 # ---------------------------------------------------------------------------
 

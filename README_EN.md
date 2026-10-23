@@ -14,6 +14,7 @@
 - **Auto-reconnect** — periodic health checks detect connection loss and rebuild the pool automatically (retried with exponential backoff); existing sessions switch to the new pool transparently
 - **Multi-table JOIN** — Explicit ON conditions with `Row` objects supporting both attribute and dictionary access
 - **Row locking** — `for_update()` / `for_update(skip_locked=True)` pessimistic locks; executing outside a transaction raises immediately
+- **Nested transactions** — `transaction()` can be nested; inner blocks switch to `SAVEPOINT` so an inner rollback leaves the outer transaction intact
 - **Raw SQL** — `execute_raw()` / `fetch_raw()` / `fetch_one_raw()` to bypass the ORM when needed
 - **Enum support** — Python `enum.Enum` subclasses map to PostgreSQL custom enum types or MySQL inline `ENUM(...)`
 
@@ -313,6 +314,17 @@ async with session.transaction():
     await session.save(bob)
     # Auto-rollback on exception, auto-commit on success
 
+# Nested transaction (uses SAVEPOINT automatically, only the inner part rolls back)
+async with session.transaction():
+    await session.save(alice)
+    try:
+        async with session.transaction():
+            await session.save(bob)
+            raise RuntimeError("roll back bob only")
+    except RuntimeError:
+        pass
+    # alice is still in the outer transaction and can be committed
+
 # Health check
 ok = await session.dialect.ping()  # True → connection is healthy
 ```
@@ -385,6 +397,98 @@ await session.execute_raw("DELETE FROM users WHERE status = %s", ["inactive"])
 rows = await session.fetch_raw("SELECT id, name FROM users WHERE age > %s", [18])
 row = await session.fetch_one_raw("SELECT * FROM users WHERE id = %s", [1])
 ```
+
+#### Return values
+
+| Method | Returns | Notes |
+|---|---|---|
+| `execute_raw(sql, params=None)` | `int` | Affected row count for writes; `0` for DDL. **Does not return `lastrowid`** — use `save()` if you need the generated PK |
+| `fetch_raw(sql, params=None)` | `list[dict[str, Any]]` | `[]` when nothing matches |
+| `fetch_one_raw(sql, params=None)` | `dict[str, Any]` or `None` | `None` when nothing matches |
+
+`params` must be a `list` (not a tuple or dict) in placeholder order; omitting it is the same as `[]`.
+
+> `execute_raw()` is meant for writes. It will run a `SELECT`, but the return value has no stable meaning (MySQL returns the row count, PostgreSQL parses the status string) — use `fetch_raw()` / `fetch_one_raw()` to read data.
+
+#### Rows are raw driver dicts — not models, not `Row`
+
+```python
+rows = await session.fetch_raw("SELECT id, name FROM users WHERE age > %s", [18])
+# [{"id": 1, "name": "alice"}, {"id": 2, "name": "bob"}]
+
+rows[0]["name"]   # dictionary access only
+rows[0].name      # ✗ AttributeError — that's a join() Row, not a raw row
+```
+
+- **Keys are the column labels from your SQL**, with no mapping to model field names (`SELECT id AS user_id` → key `user_id`)
+- **Duplicate column names need aliases**: `SELECT 1 AS a, 2 AS a` becomes `{"a": 1, ".a": 2}` on MySQL (the driver renames it) and `{"a": 2}` on PostgreSQL (last one wins). Always alias in JOIN queries: `a.id AS a_id, b.id AS b_id`
+- Every row is a plain `dict`, so `json.dumps`, `dict(row)` and `**row` all work
+
+#### Placeholders are dialect-specific
+
+vorm does not rewrite raw SQL, so placeholders must match the database:
+
+```python
+# MySQL
+await session.fetch_raw("SELECT * FROM users WHERE id = %s", [1])
+# PostgreSQL
+await session.fetch_raw("SELECT * FROM users WHERE id = $1", [1])
+```
+
+The same statement cannot be reused across dialects; when you really need that, generate the placeholder with `session.dialect.render_placeholder(1)` (MySQL → `%s`, PostgreSQL → `$1`).
+
+#### Values keep the driver's native types
+
+`query()` decodes JSON columns into `dict`/`list` and runs Pydantic validation; **raw SQL skips all of that** and returns exactly what the driver produces:
+
+| SQL type | MySQL (`asyncmy`) | PostgreSQL (`asyncpg`) |
+|---|---|---|
+| `INT` / `BIGINT` | `int` | `int` |
+| `FLOAT` / `DOUBLE` | `float` | `float` |
+| `DECIMAL` / `NUMERIC` | `Decimal` | `Decimal` |
+| `BOOL` / `TINYINT(1)` | `int` (`0` / `1`) | `bool` |
+| `DATE` | `date` | `date` |
+| `DATETIME` / `TIMESTAMP` | `datetime` (naive) | `datetime` (`timestamptz` carries `tzinfo`, UTC) |
+| `TIME` | `timedelta` | `time` |
+| `INTERVAL` | — | `timedelta` |
+| `BLOB` / `BYTEA` | `bytes` | `bytes` |
+| `JSON` / `JSONB` | `str` (raw text) | `str` (raw text) |
+| `ENUM` | `str` | `str` |
+
+Two common gotchas: **JSON columns come back as strings**, so call `json.loads()` yourself; **MySQL `BOOL` is an `int` of `0`/`1`**, not `True`/`False`.
+
+```python
+import json
+
+rows = await session.fetch_raw("SELECT id, config FROM articles", [])
+articles = [{"id": r["id"], "config": json.loads(r["config"])} for r in rows]
+```
+
+#### Turning rows into models
+
+Hand the rows to Pydantic (after `loads`-ing JSON columns if needed), or just use `query()`:
+
+```python
+from pydantic import TypeAdapter
+
+rows = await session.fetch_raw("SELECT id, name, age FROM users", [])
+users = TypeAdapter(list[User]).validate_python(rows)   # column labels must match field names
+
+# Equivalent and simpler: go through the ORM, returns list[User]
+users = await session.query(User).all()
+```
+
+#### Shared connection with transactions
+
+Raw SQL and the ORM use the same Session/dialect, so statements issued inside a transaction take part in it and roll back together:
+
+```python
+async with session.transaction():
+    await session.execute_raw("UPDATE accounts SET balance = balance - %s WHERE id = %s", [100, 1])
+    await session.execute_raw("UPDATE accounts SET balance = balance + %s WHERE id = %s", [100, 2])
+```
+
+> The "must be inside a transaction" guard on `for_update()` only covers the query builder; if you hand-write `SELECT ... FOR UPDATE`, make sure it runs inside `session.transaction()` yourself.
 
 ## Logging
 
