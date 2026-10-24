@@ -20,18 +20,31 @@ class Session:
 
     # -- 单条增 / 改 --------------------------------------------------------
 
-    async def save(self, instance: Model) -> None:
+    async def insert(self, instance: Model) -> None:
+        """始终插入一条记录；自增主键为空时会在插入后回填。"""
         pk_name = instance.primary_key_name()
         pk_value = getattr(instance, pk_name)
-        if pk_value is None:
-            sql, params = self.dialect.build_insert(instance)
-            result = await self.dialect.execute_insert(sql, params)
-            info = type(instance).__column_info__[pk_name]
-            if info.auto_increment and result is not None:
-                setattr(instance, pk_name, result)
-            return
+        sql, params = self.dialect.build_insert(instance)
+        result = await self.dialect.execute_insert(sql, params)
+        info = type(instance).__column_info__[pk_name]
+        if pk_value is None and info.auto_increment and result is not None:
+            setattr(instance, pk_name, result)
+
+    async def update(self, instance: Model) -> None:
+        """始终更新一条记录；实例必须具有非空主键。"""
+        pk_name = instance.primary_key_name()
+        if getattr(instance, pk_name) is None:
+            raise ValueError(f"Cannot update {type(instance).__name__} without a primary key")
         sql, params = self.dialect.build_update(instance)
         await self.dialect.execute(sql, params)
+
+    async def save(self, instance: Model) -> None:
+        """按主键是否为空分派到 INSERT 或 UPDATE；不执行 upsert。"""
+        pk_name = instance.primary_key_name()
+        if getattr(instance, pk_name) is None:
+            await self.insert(instance)
+        else:
+            await self.update(instance)
 
     # -- 批量插入 -----------------------------------------------------------
 
@@ -54,33 +67,56 @@ class Session:
 
     # -- 原生 SQL -----------------------------------------------------------
 
-    async def execute_raw(self, sql: str, params: list[Any] | None = None) -> Any:
-        """执行任意写操作（INSERT / UPDATE / DELETE / DDL），返回受影响行数。"""
-        return await self.dialect.execute(sql, params or [])
+    async def execute_raw(self, sql: str, params: list[Any] | None = None) -> int:
+        """执行任意写操作（INSERT / UPDATE / DELETE / DDL），返回受影响行数。
+
+        占位符随方言：MySQL 用 ``%s``，PostgreSQL 用 ``$1``（vorm 不改写原生 SQL）。
+        不返回自增主键（``lastrowid``），需要主键请用 ``save()``；读取数据请用
+        ``fetch_raw()`` / ``fetch_one_raw()``——对 ``SELECT`` 的返回值没有稳定语义。
+        """
+        result = await self.dialect.execute(sql, params or [])
+        return int(result) if result is not None else 0
 
     async def fetch_raw(self, sql: str, params: list[Any] | None = None) -> list[dict[str, Any]]:
-        """执行任意 SELECT 查询，返回行字典列表。"""
+        """执行任意 SELECT，返回 ``list[dict]``，无结果时为 ``[]``。
+
+        每行是驱动的原始字典，key 为 SQL 中的列标签（不做模型字段映射），值为
+        驱动原生类型：``JSON`` 列是 ``str``（需自行 ``json.loads``），MySQL 的
+        ``BOOL`` 是 ``0``/``1`` 的 ``int``。需要模型对象请用 ``query()``，或在
+        反序列化 JSON 后交给 Pydantic 校验。
+        """
         return await self.dialect.fetch(sql, params or [])
 
     async def fetch_one_raw(
         self, sql: str, params: list[Any] | None = None
     ) -> dict[str, Any] | None:
-        """执行任意 SELECT 查询，返回单行字典或 None。"""
+        """执行任意 SELECT，返回首行 ``dict``，无结果时为 ``None``（格式同 ``fetch_raw()``）。"""
         return await self.dialect.fetchrow(sql, params or [])
 
     # -- 事务 ---------------------------------------------------------------
 
     @asynccontextmanager
     async def transaction(self) -> AsyncIterator[Session]:
-        """事务上下文管理器。
+        """事务上下文管理器，支持嵌套。
 
         用法::
 
             async with session.transaction():
                 await session.save(alice)
-                await session.save(bob)
+                async with session.transaction():   # 自动使用 SAVEPOINT
+                    await session.save(bob)
+                # 内层抛异常只回滚内层，外层继续
                 # 抛异常自动回滚，正常结束自动提交
+
+        最外层开启真实事务；在已开启的事务中再次进入时自动创建
+        ``SAVEPOINT``，内层正常退出 → 释放保存点，内层抛异常 →
+        仅回滚到保存点，外层已写入的数据不受影响。
         """
+        if self.dialect.in_transaction:
+            async with self.dialect.savepoint():
+                yield self
+            return
+
         await self.dialect.begin()
         try:
             yield self

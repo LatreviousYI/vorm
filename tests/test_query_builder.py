@@ -60,6 +60,14 @@ class User(Model):
     age: int | None = None
 
 
+class ManualPKUser(Model):
+    class Meta:
+        table = "manual_pk_users"
+
+    id: int = Field(primary_key=True)
+    name: str
+
+
 @pytest.fixture
 def session() -> Session:
     return Session(DummyDialect())
@@ -284,6 +292,63 @@ class RecordingDialect(AbstractDialect):
 
     async def introspect_columns(self, table_name: str) -> dict[str, Any]:
         return {}
+
+
+async def test_insert_with_manual_pk_keeps_pk_and_inserts() -> None:
+    dialect = RecordingDialect(insert_result=99)
+    session = Session(dialect)
+    user = User(id=7, name="Alice", age=25)
+
+    await session.insert(user)
+
+    assert "INSERT" in dialect.last_sql
+    assert '"id"' in dialect.last_sql
+    assert dialect.last_params == [7, "Alice", 25]
+    assert user.id == 7
+
+
+async def test_insert_with_non_auto_increment_pk_includes_pk() -> None:
+    dialect = RecordingDialect()
+    session = Session(dialect)
+    user = ManualPKUser(id=7, name="Alice")
+
+    await session.insert(user)
+
+    assert dialect.last_sql == 'INSERT INTO "manual_pk_users" ("id", "name") VALUES ($1, $2)'
+    assert dialect.last_params == [7, "Alice"]
+
+
+async def test_insert_without_pk_backfills_generated_pk() -> None:
+    dialect = RecordingDialect(insert_result=42)
+    session = Session(dialect)
+    user = User(name="Alice", age=25)
+
+    await session.insert(user)
+
+    assert "INSERT" in dialect.last_sql
+    assert user.id == 42
+
+
+async def test_update_rejects_missing_pk_without_dialect_call() -> None:
+    dialect = RecordingDialect()
+    session = Session(dialect)
+    user = User(name="Alice", age=25)
+
+    with pytest.raises(ValueError, match="without a primary key"):
+        await session.update(user)
+
+    assert dialect.last_sql == ""
+
+
+async def test_update_with_pk_executes_update() -> None:
+    dialect = RecordingDialect()
+    session = Session(dialect)
+    user = User(id=7, name="Alice", age=25)
+
+    await session.update(user)
+
+    assert "UPDATE" in dialect.last_sql
+    assert dialect.last_params[-1] == 7
 
 
 async def test_save_insert_calls_execute_insert_and_backfills_pk() -> None:

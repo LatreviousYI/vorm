@@ -206,6 +206,32 @@ async def _scenario_nowait(engine: Engine) -> None:
         await b.close()
 
 
+async def _scenario_nested_transaction(engine: Engine) -> None:
+    """嵌套事务：内层回滚只撤销内层写入，外层照常提交。"""
+
+    class _Boom(Exception):
+        pass
+
+    session = engine.session()
+    try:
+        async with session.transaction():
+            await session.save(LockMessage(status="outer", worker="nested"))
+            with pytest.raises(_Boom):
+                async with session.transaction():
+                    await session.save(LockMessage(status="inner", worker="nested"))
+                    raise _Boom
+            await session.save(LockMessage(status="after", worker="nested"))
+
+        rows = await (
+            session.query(LockMessage)
+            .filter(col(LockMessage.worker) == "nested")
+            .all()
+        )
+        assert sorted(row.status for row in rows) == ["after", "outer"]
+    finally:
+        await session.close()
+
+
 # ---------------------------------------------------------------------------
 # MySQL
 # ---------------------------------------------------------------------------
@@ -253,6 +279,9 @@ class TestMySQL:
         if version < (8, 0):
             pytest.skip(f"MySQL {version} < 8.0: no NOWAIT")
         await _scenario_nowait(mysql_engine)
+
+    async def test_nested_transaction_savepoint(self, mysql_engine: Engine) -> None:
+        await _scenario_nested_transaction(mysql_engine)
 
     async def test_reads_outside_transaction_leave_no_open_trx(
         self, mysql_engine: Engine
@@ -324,6 +353,9 @@ class TestPostgreSQL:
         if version < (9, 5):
             pytest.skip(f"PostgreSQL {version} < 9.5: no NOWAIT")
         await _scenario_nowait(pg_engine)
+
+    async def test_nested_transaction_savepoint(self, pg_engine: Engine) -> None:
+        await _scenario_nested_transaction(pg_engine)
 
     async def test_reads_outside_transaction_leave_no_open_trx(self, pg_engine: Engine) -> None:
         """事务外读不在服务器端留下 idle in transaction 连接。"""
