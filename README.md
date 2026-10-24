@@ -201,8 +201,13 @@ await Article.sync_table(session.dialect)
 ```python
 # INSERT
 article = Article(title="Hello", tags=["tech"])
-await session.save(article)          # 单条插入，id 自动回填
-await session.bulk_insert([...])     # 批量插入
+await session.insert(article)        # 始终插入；自增 id 自动回填
+manual = Article(id=100, title="Custom ID", tags=[])
+await session.insert(manual)         # 手动主键也会写入
+await session.bulk_insert([...])    # 批量插入
+
+# save 是兼容的便捷分派：主键为 None 时 INSERT，否则 UPDATE；不是 upsert
+await session.save(article)
 
 # SELECT
 await session.query(Article).all()                             # 全表
@@ -215,8 +220,9 @@ await session.query(Article).order_by(col(Article.id).desc()).limit(10).offset(2
 
 # UPDATE
 article.view_count += 1
-await session.save(article)          # 主键不为 None → UPDATE
-await session.query(Article).filter(Article.view_count == 0).update(view_count=1)  # 批量
+await session.update(article)         # 主键必须存在；不会插入缺失记录
+# Batch update
+await session.query(Article).filter(Article.view_count == 0).update(view_count=1)
 
 # DELETE
 await session.delete(article)
@@ -402,7 +408,7 @@ row = await session.fetch_one_raw("SELECT * FROM users WHERE id = %s", [1])
 
 | 方法 | 返回类型 | 说明 |
 |---|---|---|
-| `execute_raw(sql, params=None)` | `int` | 写操作返回受影响行数；DDL 返回 `0`。**不返回 `lastrowid`**，需要自增主键请用 `save()` |
+| `execute_raw(sql, params=None)` | `int` | 写操作返回受影响行数；DDL 返回 `0`。**不返回 `lastrowid`**，需要自增主键请用 `insert()` 或 `save()` |
 | `fetch_raw(sql, params=None)` | `list[dict[str, Any]]` | 无结果时返回 `[]` |
 | `fetch_one_raw(sql, params=None)` | `dict[str, Any]` 或 `None` | 无结果时返回 `None` |
 

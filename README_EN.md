@@ -198,8 +198,13 @@ First run → `CREATE TABLE IF NOT EXISTS` + `CREATE INDEX`. Subsequent runs →
 ```python
 # INSERT
 article = Article(title="Hello", tags=["tech"])
-await session.save(article)              # Single insert, id auto-populated
+await session.insert(article)            # Always INSERT; auto-increment id is populated
+manual = Article(id=100, title="Custom ID", tags=[])
+await session.insert(manual)             # A manually assigned PK is included
 await session.bulk_insert([...])         # Batch insert
+
+# save remains a convenience dispatcher: no PK -> INSERT, otherwise UPDATE; not an upsert
+await session.save(article)
 
 # SELECT
 await session.query(Article).all()                                          # All rows
@@ -212,7 +217,7 @@ await session.query(Article).order_by(col(Article.id).desc()).limit(10).offset(2
 
 # UPDATE
 article.view_count += 1
-await session.save(article)              # PK not None → UPDATE
+await session.update(article)             # Requires a PK; never inserts a missing row
 # Batch update
 await session.query(Article).filter(Article.view_count == 0).update(view_count=1)
 
@@ -402,7 +407,7 @@ row = await session.fetch_one_raw("SELECT * FROM users WHERE id = %s", [1])
 
 | Method | Returns | Notes |
 |---|---|---|
-| `execute_raw(sql, params=None)` | `int` | Affected row count for writes; `0` for DDL. **Does not return `lastrowid`** — use `save()` if you need the generated PK |
+| `execute_raw(sql, params=None)` | `int` | Affected row count for writes; `0` for DDL. **Does not return `lastrowid`** — use `insert()` or `save()` if you need the generated PK |
 | `fetch_raw(sql, params=None)` | `list[dict[str, Any]]` | `[]` when nothing matches |
 | `fetch_one_raw(sql, params=None)` | `dict[str, Any]` or `None` | `None` when nothing matches |
 
