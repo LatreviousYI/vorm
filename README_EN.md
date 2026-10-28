@@ -442,6 +442,8 @@ await session.fetch_raw("SELECT * FROM users WHERE id = $1", [1])
 
 The same statement cannot be reused across dialects; when you really need that, generate the placeholder with `session.dialect.render_placeholder(1)` (MySQL → `%s`, PostgreSQL → `$1`).
 
+> On MySQL, a literal `%` inside the SQL must be written as `%%` (e.g. `LIKE 'abc%%'`), otherwise the driver treats it as a placeholder and raises `not enough arguments for format string`.
+
 #### Values keep the driver's native types
 
 `query()` decodes JSON columns into `dict`/`list` and runs Pydantic validation; **raw SQL skips all of that** and returns exactly what the driver produces:
@@ -562,6 +564,8 @@ class Meta:
 ```
 
 Index naming convention: `ix_{table}_{fields}` (regular), `unq_{table}_{fields}` (unique).
+
+**Over-long index names are truncated automatically**: MySQL caps identifiers at 64 characters (error 1059 when exceeded) and PostgreSQL at 63 bytes (silently truncated). Any name (auto-generated or explicit) exceeding 63 bytes is truncated to "prefix + last 8 hex chars of the name's md5", e.g. `ix_very_long_table_very_long_field_a1b2c3d4` — the same input always yields the same result, so `sync_table()`'s existing-index comparison keeps working; different long names sharing a prefix get different hash suffixes and never collide. Prefer a short explicit `Index(name=...)` if you don't want truncation.
 
 ### Python → SQL Type Mapping
 

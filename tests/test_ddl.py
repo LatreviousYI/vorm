@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime
 import enum
+import hashlib
 from typing import Any
 
 import pytest
@@ -962,6 +963,87 @@ def test_index_name_auto_generation() -> None:
 
     named = Index(fields=("a", "b"), name="my_idx")
     assert named.index_name("indexed") == "my_idx"
+
+
+# ---------------------------------------------------------------------------
+# 索引名超长截断
+# ---------------------------------------------------------------------------
+
+
+def test_index_name_short_unchanged() -> None:
+    """不超过 63 字节的名称（自动 / 显式）原样返回。"""
+    assert Index(fields=("name", "age")).index_name("indexed") == "ix_indexed_name_age"
+    assert Index(fields=("a",), name="my_idx").index_name("t") == "my_idx"
+
+
+def test_index_name_auto_truncated_when_too_long() -> None:
+    """自动生成的超长索引名截断到 63 字节内，并带确定性 md5 后缀。"""
+    table = "t" * 30
+    fields = ("f" * 20, "g" * 20)  # 完整名 74 字节
+    full = f"ix_{table}_{fields[0]}_{fields[1]}"
+
+    ix = Index(fields=fields)
+    name = ix.index_name(table)
+
+    assert len(full.encode()) > 63
+    assert len(name.encode()) <= 63
+    digest = hashlib.md5(full.encode()).hexdigest()[:8]
+    assert name.endswith(f"_{digest}")
+    # 同一输入永远得到同一结果（sync_table 依赖此性质跳过已有索引）
+    assert ix.index_name(table) == name
+
+
+def test_index_name_explicit_truncated() -> None:
+    """显式 name 超长同样截断，规则与自动名一致。"""
+    explicit = "x" * 80
+    named = Index(fields=("a",), name=explicit)
+
+    name = named.index_name("any_table")
+
+    assert len(name.encode()) <= 63
+    digest = hashlib.md5(explicit.encode()).hexdigest()[:8]
+    assert name.endswith(f"_{digest}")
+
+
+def test_index_name_truncation_keeps_names_distinct() -> None:
+    """共享前缀的两个超长名，截断后哈希后缀不同、互不冲突。"""
+    base = "a" * 60
+    n1 = Index(fields=("x",), name=f"{base}1").index_name("t")
+    n2 = Index(fields=("x",), name=f"{base}2").index_name("t")
+
+    assert n1 != n2
+    assert len(n1.encode()) <= 63
+    assert len(n2.encode()) <= 63
+
+
+def test_index_name_truncated_by_bytes_not_chars() -> None:
+    """PostgreSQL 按 63 字节计，多字节字符按 UTF-8 字节截断。"""
+    named = Index(fields=("a",), name="表" * 40)  # 120 字节 / 40 字符
+
+    name = named.index_name("t")
+
+    assert len(name.encode("utf-8")) <= 63
+
+
+def test_build_sync_indexes_uses_truncated_name(dialect: DDLDialect) -> None:
+    """DDL 生成走的是截断后的名字，CREATE INDEX 语句中不出现超长标识符。"""
+
+    class LongIndexModel(Model):
+        # 表名 50 字节 + 字段名 30 字节 → 完整索引名 84 字节
+        ffffffffffffffffffffffffffffff: str = Field(max_length=10)  # 30 个 f
+
+        class Meta:
+            table = "long_table_" + "x" * 40
+            indexes = [Index(fields=("ffffffffffffffffffffffffffffff",))]
+
+        id: int = Field(primary_key=True, auto_increment=True)
+
+    sqls = dialect.build_sync_indexes(LongIndexModel, existing_names=set())
+
+    assert len(sqls) == 1
+    # CREATE INDEX "ix_long_table_xxx..._hash" ON ...
+    name_part = sqls[0].split(" ON ")[0].removeprefix('CREATE INDEX "').removesuffix('"')
+    assert len(name_part.encode()) <= 63
 
 
 def test_build_sync_indexes_generates_all_when_none_exist(dialect: DDLDialect) -> None:

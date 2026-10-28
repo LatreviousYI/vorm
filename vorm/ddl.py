@@ -17,12 +17,40 @@ class Index:
     name: str | None = None  # None → 自动生成
 
     def index_name(self, table: str) -> str:
-        """自动生成或返回显式索引名。"""
+        """自动生成或返回显式索引名。
+
+        超过 63 字节时确定性截断：保留前缀 + 原名 md5 后 8 位十六进制，
+        如 ``ix_long_table_long_field_a1b2c3d4``。同一输入永远得到同一结果，
+        ``sync_table()`` 的已有索引比对因此不受影响；共享前缀的不同长名
+        后缀不同，不会互相冲突。显式 ``name`` 同样适用。
+        """
         if self.name is not None:
-            return self.name
+            return _fit_identifier(self.name)
         prefix = "unq" if self.unique else "ix"
         fields_part = "_".join(self.fields)
-        return f"{prefix}_{table}_{fields_part}"
+        return _fit_identifier(f"{prefix}_{table}_{fields_part}")
+
+
+# MySQL 标识符上限 64 字符（超长直接报 1059），PostgreSQL 为 63 字节
+# （NAMEDATALEN-1，超长被静默截断）。取两者交集 63 字节。
+MAX_IDENTIFIER_BYTES = 63
+
+# 后缀 = 1 个下划线 + 8 位十六进制（md5 前 8 位，32 bit 摘要空间）
+_HASH_SUFFIX_LEN = 9
+
+
+def _fit_identifier(name: str, max_bytes: int = MAX_IDENTIFIER_BYTES) -> str:
+    """将标识符压缩到 ``max_bytes`` 以内，超长时追加确定性哈希后缀。
+
+    按字节（UTF-8）而非字符计数，与 PostgreSQL 的 NAMEDATALEN 语义一致；
+    截断发生在字节边界，残缺的多字节字符会被丢弃。
+    """
+    raw = name.encode("utf-8")
+    if len(raw) <= max_bytes:
+        return name
+    digest = hashlib.md5(raw).hexdigest()[:_HASH_SUFFIX_LEN - 1]
+    prefix = raw[: max_bytes - _HASH_SUFFIX_LEN].decode("utf-8", errors="ignore")
+    return f"{prefix}_{digest}"
 
 
 @dataclass
