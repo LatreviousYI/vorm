@@ -437,6 +437,8 @@ await session.fetch_raw("SELECT * FROM users WHERE id = $1", [1])
 
 同一条 SQL 不能跨库复用；确实要跨库时可用 `session.dialect.render_placeholder(1)` 生成（MySQL → `%s`，PostgreSQL → `$1`）。
 
+> MySQL 下 SQL 里字面量 `%` 必须写成 `%%`（如 `LIKE 'abc%%'`），否则驱动会把它当作占位符报 `not enough arguments for format string`。
+
 #### 类型是驱动的原样返回值
 
 ORM 的 `query()` 会把 JSON 列反序列化为 `dict`/`list` 并做 Pydantic 校验，**原生 SQL 全部跳过**，值保持驱动返回的原始类型：
@@ -554,6 +556,8 @@ class Meta:
 ```
 
 索引名自动生成规则：`ix_{table}_{fields}`（普通），`unq_{table}_{fields}`（唯一）。
+
+**超长索引名自动截断**：MySQL 标识符上限 64 字符（超长直接报 1059），PostgreSQL 为 63 字节（超长被静默截断）。超过 63 字节的名字（自动或显式指定）会被截断为「前缀 + 原名 md5 后 8 位十六进制」，例如 `ix_very_long_table_very_long_field_a1b2c3d4`——同一输入永远得到同一结果，`sync_table()` 的已有索引比对不受影响；共享前缀的不同长名哈希后缀不同，不会冲突。不想依赖截断也可以直接在 `Index(name=...)` 里给个短名。
 
 ### Python → SQL 类型映射
 
