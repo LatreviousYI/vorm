@@ -20,18 +20,31 @@ class Session:
 
     # -- 单条增 / 改 --------------------------------------------------------
 
-    async def save(self, instance: Model) -> None:
+    async def insert(self, instance: Model) -> None:
+        """始终插入一条记录；自增主键为空时会在插入后回填。"""
         pk_name = instance.primary_key_name()
         pk_value = getattr(instance, pk_name)
-        if pk_value is None:
-            sql, params = self.dialect.build_insert(instance)
-            result = await self.dialect.execute_insert(sql, params)
-            info = type(instance).__column_info__[pk_name]
-            if info.auto_increment and result is not None:
-                setattr(instance, pk_name, result)
-            return
+        sql, params = self.dialect.build_insert(instance)
+        result = await self.dialect.execute_insert(sql, params)
+        info = type(instance).__column_info__[pk_name]
+        if pk_value is None and info.auto_increment and result is not None:
+            setattr(instance, pk_name, result)
+
+    async def update(self, instance: Model) -> None:
+        """始终更新一条记录；实例必须具有非空主键。"""
+        pk_name = instance.primary_key_name()
+        if getattr(instance, pk_name) is None:
+            raise ValueError(f"Cannot update {type(instance).__name__} without a primary key")
         sql, params = self.dialect.build_update(instance)
         await self.dialect.execute(sql, params)
+
+    async def save(self, instance: Model) -> None:
+        """按主键是否为空分派到 INSERT 或 UPDATE；不执行 upsert。"""
+        pk_name = instance.primary_key_name()
+        if getattr(instance, pk_name) is None:
+            await self.insert(instance)
+        else:
+            await self.update(instance)
 
     # -- 批量插入 -----------------------------------------------------------
 
