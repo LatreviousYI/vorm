@@ -2,6 +2,319 @@
 
 [English](./README_EN.md)
 
+> **🤖 给 AI 使用**：将下面折叠区块里的内容**完整复制**，粘贴到任意 AI 工具（Claude、ChatGPT 等）的对话中，AI 即可准确使用 vorm 编写代码。
+>
+> 如果你的 AI 工具支持联网读取，也可以直接把这个链接发给它：  
+> 👉 <https://raw.githubusercontent.com/LatreviousYI/vorm/master/README.md>
+
+<details>
+<summary>📋 点击展开 AI 提示词（复制全部内容）</summary>
+
+```
+你是一个 Python 专家。请严格遵照以下 vorm 库的使用方式和约束来编写代码。
+如果需要更详细的文档，请读取：https://raw.githubusercontent.com/LatreviousYI/vorm/master/README.md
+
+# vorm — Async ORM for Python 3.10+
+
+vorm 是基于 Pydantic v2 的异步 ORM，支持 MySQL（asyncmy 驱动）和 PostgreSQL（asyncpg 驱动）。
+没有外键、多对一、多对多关系功能，JOIN 需要显式写 ON 条件。
+
+## 安装
+
+```bash
+pip install vorm
+```
+
+## 模型定义
+
+```python
+import datetime
+from vorm import Field, Model
+from vorm.ddl import Index
+
+class Article(Model):
+    class Meta:
+        table = "articles"                              # 表名（必填）
+        indexes = [
+            Index(fields=("title",)),                    # 单列索引
+            Index(fields=("title", "created_at")),       # 联合索引
+            Index(fields=("slug",), unique=True),         # 唯一索引
+        ]
+
+    id: int = Field(primary_key=True, auto_increment=True)
+    title: str = Field(max_length=200)
+    body: str                                           # 不指定 max_length → TEXT
+    tags: list = Field(default_factory=list)             # → JSON/JSONB
+    view_count: int = Field(default=0)
+    created_at: datetime.datetime = Field(
+        default_factory=datetime.datetime.now,
+        timestamp_behavior="create",                     # INSERT 时数据库生成，UPDATE 保留原值
+    )
+    updated_at: datetime.datetime = Field(
+        default_factory=datetime.datetime.now,
+        timestamp_behavior="both",                       # INSERT 和 UPDATE 时数据库自动刷新
+    )
+```
+
+## Field 参数
+
+| 参数 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `primary_key` | `bool` | `False` | 主键 |
+| `auto_increment` | `bool` | `False` | 自增（仅 int 主键） |
+| `column_name` | `str \| None` | `None` | 数据库列名，默认取 Python 属性名 |
+| `nullable` | `bool` | `True` | 是否允许 NULL |
+| `unique` | `bool` | `False` | 唯一约束 |
+| `index` | `bool` | `False` | 单列索引 |
+| `max_length` | `int \| None` | `None` | 字符串长度 → VARCHAR(n)；不指定 → TEXT |
+| `db_type` | `str \| None` | `None` | 直接指定数据库类型（如 `decimal(15,5)`） |
+| `comment` | `str \| None` | `None` | 列注释 |
+| `timestamp_behavior` | `"create"` `"update"` `"both"` `None` | `None` | 自动时间戳行为 |
+
+## Python → SQL 类型映射
+
+| Python | MySQL | PostgreSQL |
+|---|---|---|
+| `int` | `INT` | `INTEGER` |
+| `int` + `auto_increment` PK | `INT AUTO_INCREMENT` | `SERIAL` |
+| `str` + `max_length` | `VARCHAR(n)` | `VARCHAR(n)` |
+| `str` 无 `max_length` | `TEXT` | `TEXT` |
+| `bool` | `BOOL` | `BOOLEAN` |
+| `float` | `DOUBLE` | `DOUBLE PRECISION` |
+| `bytes` | `BLOB` | `BYTEA` |
+| `datetime.datetime` | `DATETIME` | `TIMESTAMP` |
+| `datetime.date` | `DATE` | `DATE` |
+| `decimal.Decimal` | `DECIMAL(18,6)` | `DECIMAL(18,6)` |
+| `dict` | `JSON` | `JSONB` |
+| `list` | `JSON` | `JSONB` |
+| `enum.Enum` 子类 | `ENUM(...)` | 自定义 TYPE |
+
+## 连接数据库
+
+```python
+from vorm.engine import create_mysql_engine, create_postgresql_engine
+
+# MySQL —— 务必传 autocommit=True！
+engine = await create_mysql_engine(
+    host="127.0.0.1", port=3306, user="root",
+    password="pwd", database="test", minsize=10, maxsize=20,
+    autocommit=True,  # 必须！否则会有过期读和 DDL 阻塞问题
+)
+session = engine.session()
+
+# PostgreSQL
+engine = await create_postgresql_engine(
+    host="127.0.0.1", port=5432, user="root",
+    password="pwd", database="test", min_size=50, max_size=100,
+)
+session = engine.session()
+
+# 关闭
+await engine.close()
+```
+
+## DDL 同步（建表 / 加列 / 加索引）
+
+```python
+await Article.sync_table(session.dialect)
+# 首次 → CREATE TABLE IF NOT EXISTS + CREATE INDEX
+# 后续 → ALTER TABLE ADD COLUMN / MODIFY COLUMN / CREATE INDEX
+# 永不删除列、表或索引（只增不改不删）
+```
+
+## CRUD
+
+```python
+# === INSERT ===
+article = Article(title="Hello", tags=["tech"])
+await session.insert(article)          # 始终 INSERT，自增 id 自动回填
+await session.bulk_insert([...])       # 批量插入
+
+# === save（便捷分派）===
+# 主键为 None → INSERT，否则 → UPDATE（不是 upsert）
+await session.save(article)
+
+# === SELECT ===
+await session.query(Article).all()                                          # 全表
+await session.query(Article).filter(Article.view_count >= 10).all()         # 条件过滤
+await session.query(Article).filter(Article.id == 1).one()                  # 精确一条（无则报错）
+await session.query(Article).filter(Article.title.like("Hello%")).first()   # 第一条（无则 None）
+await session.query(Article).count()                                        # 计数
+await session.query(Article).filter(Article.id == 1).exists()               # 存在性检查
+await session.query(Article).order_by(col(Article.id).desc()).limit(10).offset(20).all()  # 分页
+
+# === UPDATE ===
+article.view_count += 1
+await session.update(article)           # 按主键更新，主键必须存在
+# 批量更新
+await session.query(Article).filter(Article.view_count == 0).update(view_count=1)
+
+# === DELETE ===
+await session.delete(article)
+await session.query(Article).filter(Article.view_count == 0).delete()  # 批量
+```
+
+## 排序
+
+```python
+from vorm import col
+
+# 用 col() 包裹类级字段来调用 desc()/asc()（消除类型检查器误报）
+await session.query(Article).order_by(col(Article.id).desc()).all()
+await session.query(Article).order_by(col(Article.id).asc()).all()
+
+# 多字段排序
+await session.query(Article).order_by(
+    col(Article.view_count).desc(),
+    col(Article.id).asc(),
+).all()
+```
+
+## 高级查询
+
+```python
+# LIKE / BETWEEN
+await session.query(User).filter(col(User.name).like("张%")).all()
+await session.query(Book).filter(col(Book.price).between(10, 50)).all()
+
+# IN / IS NULL
+await session.query(User).filter(col(User.role).in_(["admin", "editor"])).all()
+await session.query(User).filter(col(User.email).is_null()).all()
+
+# AND / OR
+cond = (User.age >= 18) & (User.role == "member")       # AND
+cond = (User.role == "admin") | (User.role == "staff")   # OR
+
+# JSON 路径查询
+await session.query(Article).filter(col(Article.tags).json_path("$[0]") == "tech").all()
+await session.query(Product).filter(col(Product.data).json_path("$.price") > 100).all()
+```
+
+## 多表 JOIN
+
+```python
+# INNER JOIN
+rows = await session.query(Author).join(
+    Book, on=Author.id == Book.author_id
+).filter(Book.price > 20).all()
+
+# LEFT JOIN
+rows = await session.query(Author).join(
+    Book, on=Author.id == Book.author_id, type="LEFT"
+).all()
+
+# Row 访问
+rows[0].authors.name     # 属性访问
+rows[0]["authors.id"]    # 字典 key 访问
+dict(rows[0])            # 扁平字典
+
+# select() 指定字段 + alias() 别名
+rows = await session.query(AllFieldTypes)\
+    .join(JoinTable, on=AllFieldTypes.id == JoinTable.all_id, type="left")\
+    .select(
+        AllFieldTypes.id,
+        AllFieldTypes.short_text,
+        JoinTable.short_text.alias("j_s_t"),
+    ).all()
+
+# 反序列化到 Pydantic 模型
+from vorm.query import serialization
+result = serialization(MyPydanticModel, rows)
+```
+
+## 事务
+
+```python
+# 基本事务（异常自动回滚，正常自动提交）
+async with session.transaction():
+    await session.save(alice)
+    await session.save(bob)
+
+# 嵌套事务（内层自动使用 SAVEPOINT）
+async with session.transaction():
+    await session.save(alice)
+    try:
+        async with session.transaction():
+            await session.save(bob)
+            raise RuntimeError("只撤销 bob")
+    except RuntimeError:
+        pass
+    # alice 仍在事务中
+```
+
+## 行锁（FOR UPDATE）
+
+```python
+# 读-改-写防并发（必须在事务内执行）
+async with session.transaction():
+    row = await session.query(Account)\
+        .filter(col(Account.id) == 1)\
+        .for_update()\
+        .first()
+    row.balance -= 100
+    await session.save(row)
+
+# SKIP LOCKED：任务队列并发认领
+async with session.transaction():
+    msg = await session.query(Message)\
+        .filter(Message.status == "pending")\
+        .order_by(col(Message.id))\
+        .limit(1)\
+        .for_update(skip_locked=True)\
+        .first()
+```
+
+- for_update() 和 skip_locked=True / nowait=True 不能在事务外使用（会 RuntimeError）
+- 不能和 count() / exists() / update() / delete() 组合（会 ValueError）
+
+## 健康检查 & 断连重连
+
+```python
+# 后台健康监控（推荐）
+asyncio.create_task(engine.health_monitor(interval=10))
+
+# 手动 ping
+ok = await session.dialect.ping()
+
+# 手动重连
+ok = await engine.reconnect()                        # 默认重试 3 次，退避 0.5s
+ok = await engine.reconnect(retries=5, backoff=1.0)  # 自定义
+# 重连成功后已有 Session 自动切换到新连接池
+```
+
+## 原生 SQL
+
+```python
+await session.execute_raw("DELETE FROM users WHERE status = %s", ["inactive"])
+rows = await session.fetch_raw("SELECT id, name FROM users WHERE age > %s", [18])
+row = await session.fetch_one_raw("SELECT * FROM users WHERE id = %s", [1])
+```
+
+- 占位符：MySQL 用 `%s`，PostgreSQL 用 `$1, $2, ...`
+- 参数必须传 `list`（不是 tuple/dict）
+- fetch_raw() 返回 `list[dict]`，fetch_one_raw() 返回 `dict | None`
+- execute_raw() 返回受影响行数（int）
+- 原生 SQL 返回的是驱动原始类型（JSON 列是字符串需自己 json.loads()，MySQL BOOL 是 0/1 的 int）
+
+## 日志
+
+```python
+import logging
+logging.getLogger("vorm").setLevel(logging.DEBUG)  # 看所有 SQL
+```
+
+## 关键约束
+
+1. 所有 I/O 都是 `async/await`
+2. SQL 始终参数化，绝不拼接用户输入
+3. DDL 只增不改不删（不 DROP 任何东西）
+4. MySQL 连接务必传 `autocommit=True`
+5. 没有外键 / 关联关系功能
+6. ORM 不支持的操作（如子查询、窗口函数、UNION、复杂聚合等），直接用原生 SQL（execute_raw / fetch_raw / fetch_one_raw）实现
+```
+
+</details>
+
 **Async ORM for Python 3.10+** — MySQL and PostgreSQL, 基于 Pydantic v2 开发, 以pydantic作为数据模型,同时增加额外字段属性作为数据库字段必要属性,从而可以操作数据库表结构.这个库以精简为主,不提供外键以及多对一,多对多等键功能
 
 ## 特性
