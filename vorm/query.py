@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import json as _json_mod
+from vorm._json import JSONDecodeError, loads as _json_loads
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Generic, TypeVar, cast
 
@@ -183,8 +183,8 @@ class QuerySet(Generic[ModelT]):
                     val = row.get(field_name)
                     if isinstance(val, str):
                         try:
-                            row[field_name] = _json_mod.loads(val)
-                        except (_json_mod.JSONDecodeError, TypeError, ValueError):
+                            row[field_name] = _json_loads(val)
+                        except (JSONDecodeError, TypeError, ValueError):
                             pass
         return [self.model.model_validate(row) for row in rows]
 

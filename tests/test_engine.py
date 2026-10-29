@@ -499,6 +499,232 @@ async def test_engine_reconnect_gives_up_after_retries() -> None:
     assert attempts["n"] == 3
 
 
+# ---------------------------------------------------------------------------
+# PoolRef + asyncmy 风格 Pool（context manager acquire）正确性验证
+# ---------------------------------------------------------------------------
+
+
+class _RealisticPoolConn:
+    """模拟 asyncmy Connection"""
+
+    def __init__(self, conn_id: int = 0) -> None:
+        self.conn_id = conn_id
+        self._connected = True
+        self._in_transaction = False
+
+    @property
+    def connected(self) -> bool:
+        return self._connected
+
+    def get_transaction_status(self) -> bool:
+        return self._in_transaction
+
+
+class _RealisticPoolAcquireCM:
+    """精确模拟 asyncmy.contexts._PoolAcquireContextManager 的行为"""
+
+    __slots__ = ("_coro", "_conn", "_pool")
+
+    def __init__(self, coro: Any, pool: Any) -> None:
+        self._coro = coro
+        self._conn: Any = None
+        self._pool = pool
+
+    async def __aenter__(self) -> Any:
+        self._conn = await self._coro
+        return self._conn
+
+    async def __aexit__(self, *args: Any) -> None:
+        try:
+            await self._pool.release(self._conn)
+        finally:
+            self._pool = None
+            self._conn = None
+
+
+class _RealisticPool:
+    """模拟 asyncmy.Pool 的核心行为：
+    - _free (deque), _used (set), _cond (Condition)
+    - acquire() → _acquire() coroutine → _RealisticPoolAcquireCM
+    - release() → _used.remove → _free.append → notify
+    """
+
+    def __init__(self, name: str = "") -> None:
+        import asyncio
+        from collections import deque
+
+        self.name = name
+        self._free: deque[Any] = deque()
+        self._used: set[Any] = set()
+        self._cond = asyncio.Condition()
+        self._conn_counter = 0
+        self._closing = False
+
+    # -- 模拟预设一些空闲连接 --
+    def add_free_conn(self) -> _RealisticPoolConn:
+        self._conn_counter += 1
+        conn = _RealisticPoolConn(self._conn_counter)
+        self._free.append(conn)
+        return conn
+
+    # -- acquire() 返回 context manager（与 asyncmy 完全一致） --
+    def acquire(self) -> _RealisticPoolAcquireCM:
+        coro = self._acquire()
+        return _RealisticPoolAcquireCM(coro, self)
+
+    async def _acquire(self) -> _RealisticPoolConn:
+        async with self._cond:
+            while True:
+                if self._free:
+                    conn = self._free.popleft()
+                    self._used.add(conn)
+                    return conn
+                await self._cond.wait()
+
+    # -- release（同步方法，返回 Future，与 asyncmy 完全一致） --
+    def release(self, conn: _RealisticPoolConn) -> Any:
+        loop = asyncio.get_event_loop()
+        fut: asyncio.Future[None] = loop.create_future()
+        fut.set_result(None)
+
+        if conn in self._used:
+            self._used.remove(conn)
+        if conn.connected:
+            if conn.get_transaction_status():
+                conn._connected = False  # 模拟 close()
+            elif self._closing:
+                conn._connected = False
+            else:
+                self._free.append(conn)
+            fut = loop.create_task(self._wakeup())
+        return fut
+
+    async def _wakeup(self) -> None:
+        async with self._cond:
+            self._cond.notify()
+
+    @property
+    def freesize(self) -> int:
+        return len(self._free)
+
+    @property
+    def usedsize(self) -> int:
+        return len(self._used)
+
+    def close(self) -> None:
+        self._closing = True
+
+    async def wait_closed(self) -> None:
+        pass
+
+
+async def test_poolref_non_tx_acquire_release_returns_to_correct_pool() -> None:
+    """非事务路径：通过 PoolRef 获取连接 → 释放后应回到原池的 _free 中。
+
+    这也是 MySQL dialect execute/fetch 等方法的实际执行路径。
+    """
+    from vorm.engine import PoolRef
+
+    pool = _RealisticPool()
+    # 预设一条空闲连接
+    free_conn = pool.add_free_conn()
+    assert pool.freesize == 1
+    assert pool.usedsize == 0
+
+    ref = PoolRef(pool)
+
+    # 模拟 MySQLDialect 非事务路径的 acquire
+    async with ref.acquire() as conn:
+        assert conn is free_conn  # 拿到了预设的连接
+        assert pool.usedsize == 1
+        assert pool.freesize == 0
+
+    # 退出 context 后：
+    # - release() 检查 in_transaction → False → _free.append(conn)
+    assert pool.usedsize == 0
+    assert pool.freesize == 1
+    assert pool._free[0] is free_conn  # 同一条连接
+
+
+async def test_poolref_concurrent_acquires_dont_mix_pools() -> None:
+    """两个独立池通过各自的 PoolRef 并发使用，连接不能串池。"""
+    import asyncio
+    from vorm.engine import PoolRef
+
+    pool_a = _RealisticPool("A")
+    pool_b = _RealisticPool("B")
+    conn_a1 = pool_a.add_free_conn()
+    conn_a2 = pool_a.add_free_conn()
+    conn_b1 = pool_b.add_free_conn()
+
+    ref_a = PoolRef(pool_a)
+    ref_b = PoolRef(pool_b)
+
+    async def use_pool(ref: PoolRef, expected_pool: _RealisticPool) -> _RealisticPoolConn:
+        async with ref.acquire() as conn:
+            await asyncio.sleep(0)  # 让出控制权，模拟并发交错
+            return conn  # type: ignore[return-value]
+
+    results = await asyncio.gather(use_pool(ref_a, pool_a), use_pool(ref_b, pool_b))
+
+    # 两个并发获取应各自从自己的池取连接
+    conns_a = {conn_a1, conn_a2}
+    conns_b = {conn_b1}
+    assert results[0] in conns_a
+    assert results[1] in conns_b
+
+    # 释放后各自回到自己的池
+    assert pool_a.freesize == 2
+    assert pool_b.freesize == 1
+    assert pool_a.usedsize == 0
+    assert pool_b.usedsize == 0
+
+
+async def test_poolref_release_closes_conn_with_open_transaction() -> None:
+    """模拟 autocommit=False 且忘记 commit：连接仍有事务时 release 应关闭连接（不放回池）。
+
+    这是 asyncmy pool.release() 的真实行为：in_trans → conn.close()。
+    """
+    from vorm.engine import PoolRef
+
+    pool = _RealisticPool()
+    conn = pool.add_free_conn()
+    # 模拟：执行 SQL 后事务未提交
+    conn._in_transaction = True
+
+    ref = PoolRef(pool)
+
+    async with ref.acquire() as acquired:
+        assert acquired is conn
+        acquired._in_transaction = True  # 仍未提交
+
+    # release() 应检测到 in_trans 并关闭连接，不放回 _free
+    assert pool.freesize == 0
+    assert pool.usedsize == 0
+    assert conn.connected is False  # 被关闭了
+
+
+async def test_poolref_many_rapid_acquires_maintains_pool_integrity() -> None:
+    """大量快速 acquire/release 循环，验证池状态始终一致。"""
+    from vorm.engine import PoolRef
+
+    pool = _RealisticPool()
+    # 预设 5 条连接
+    for _ in range(5):
+        pool.add_free_conn()
+
+    ref = PoolRef(pool)
+
+    for _ in range(100):
+        async with ref.acquire() as conn:
+            assert conn.connected
+            assert pool.usedsize >= 1  # 至少本条在使用
+
+    # 100 次循环后，所有连接应归还
+    assert pool.freesize == 5
+    assert pool.usedsize == 0
+
+
 async def test_mysql_dialect_tx_releases_to_origin_pool() -> None:
     """事务连接应归还到获取它的来源池（换池后不串池）。"""
     from vorm.dialects.mysql import MySQLDialect

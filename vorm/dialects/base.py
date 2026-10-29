@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import enum
-import json as _json_mod
 import re
+
+from vorm._json import dumps as _json_dumps
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -339,7 +340,7 @@ class AbstractDialect(ABC):
             for fn in field_names:
                 val = getattr(instance, fn)
                 if isinstance(val, dict | list):
-                    val = _json_mod.dumps(val)
+                    val = _json_dumps(val)
                 row_params.append(val)
             params.extend(row_params)
             row_ph = ", ".join(
@@ -372,7 +373,7 @@ class AbstractDialect(ABC):
             value = getattr(instance, field_name)
 
             if isinstance(value, dict | list):
-                value = _json_mod.dumps(value)
+                value = _json_dumps(value)
             params.append(value)
             col_sql = self.quote_identifier(column.column_name)
             placeholder = self.render_placeholder(len(params))
@@ -409,7 +410,7 @@ class AbstractDialect(ABC):
                 continue
             col = self.quote_identifier(model_columns[field_name].column_name)
             if isinstance(value, dict | list):
-                value = _json_mod.dumps(value)
+                value = _json_dumps(value)
             params.append(value)
             assignments.append(f"{col} = {self.render_placeholder(len(params))}")
 
@@ -931,7 +932,7 @@ class AbstractDialect(ABC):
             if isinstance(value, enum.Enum):
                 value = value.value
             if isinstance(value, dict | list):
-                value = _json_mod.dumps(value)
+                value = _json_dumps(value)
             field_names.append(field_name)
             params.append(value)
         return field_names, params
