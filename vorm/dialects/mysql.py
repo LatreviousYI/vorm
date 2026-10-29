@@ -72,7 +72,6 @@ class MySQLDialect(AbstractDialect):
         async with self.pool.acquire() as conn:
             async with conn.cursor() as cursor:
                 await cursor.execute(sql, params)
-                await conn.commit()
                 return cursor.rowcount
 
     async def execute_insert(self, sql: str, params: list[Any]) -> Any:
@@ -84,7 +83,6 @@ class MySQLDialect(AbstractDialect):
         async with self.pool.acquire() as conn:
             async with conn.cursor() as cursor:
                 await cursor.execute(sql, params)
-                await conn.commit()
                 return cursor.lastrowid
 
     async def fetch(self, sql: str, params: list[Any]) -> list[dict[str, Any]]:
@@ -610,5 +608,6 @@ class MySQLDialect(AbstractDialect):
 
 
 async def create_mysql_dialect(**kwargs: Any) -> MySQLDialect:
+    kwargs.setdefault("autocommit", True)
     pool = await asyncmy.create_pool(**kwargs)
     return MySQLDialect(pool)

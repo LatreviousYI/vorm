@@ -1,5 +1,318 @@
 # vorm
 
+> **🤖 For AI Tools**: Copy the **entire content** inside the collapsible block below and paste it into any AI tool (Claude, ChatGPT, etc.). The AI will then be able to write code using vorm correctly.
+>
+> If your AI tool supports web fetching, you can also send it this link directly:  
+> 👉 <https://raw.githubusercontent.com/LatreviousYI/vorm/master/README.md>
+
+<details>
+<summary>📋 Click to expand AI Prompt (copy everything inside)</summary>
+
+```
+You are a Python expert. Follow the vorm library's usage patterns and constraints strictly when writing code.
+If you need more detailed documentation, read: https://raw.githubusercontent.com/LatreviousYI/vorm/master/README.md
+
+# vorm — Async ORM for Python 3.10+
+
+vorm is an async ORM built on Pydantic v2, supporting MySQL (asyncmy driver) and PostgreSQL (asyncpg driver).
+No FK, many-to-one, or many-to-many relationship support — JOINs require explicit ON conditions.
+
+## Installation
+
+```bash
+pip install vorm
+```
+
+## Model Definition
+
+```python
+import datetime
+from vorm import Field, Model
+from vorm.ddl import Index
+
+class Article(Model):
+    class Meta:
+        table = "articles"                              # Table name (required)
+        indexes = [
+            Index(fields=("title",)),                    # Single-column index
+            Index(fields=("title", "created_at")),       # Composite index
+            Index(fields=("slug",), unique=True),         # Unique index
+        ]
+
+    id: int = Field(primary_key=True, auto_increment=True)
+    title: str = Field(max_length=200)
+    body: str                                           # No max_length → TEXT
+    tags: list = Field(default_factory=list)             # → JSON/JSONB
+    view_count: int = Field(default=0)
+    created_at: datetime.datetime = Field(
+        default_factory=datetime.datetime.now,
+        timestamp_behavior="create",                     # DB-generated on INSERT, preserved on UPDATE
+    )
+    updated_at: datetime.datetime = Field(
+        default_factory=datetime.datetime.now,
+        timestamp_behavior="both",                       # DB auto-refreshed on both INSERT and UPDATE
+    )
+```
+
+## Field Parameters
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `primary_key` | `bool` | `False` | Primary key |
+| `auto_increment` | `bool` | `False` | Auto-increment (int PK only) |
+| `column_name` | `str \| None` | `None` | DB column name, defaults to Python attribute name |
+| `nullable` | `bool` | `True` | Allow NULL |
+| `unique` | `bool` | `False` | Unique constraint |
+| `index` | `bool` | `False` | Single-column index |
+| `max_length` | `int \| None` | `None` | String length → VARCHAR(n); unset → TEXT |
+| `db_type` | `str \| None` | `None` | Direct DB type override (e.g. `decimal(15,5)`) |
+| `comment` | `str \| None` | `None` | Column comment |
+| `timestamp_behavior` | `"create"` `"update"` `"both"` `None` | `None` | Automatic timestamp behavior |
+
+## Python → SQL Type Mapping
+
+| Python | MySQL | PostgreSQL |
+|---|---|---|
+| `int` | `INT` | `INTEGER` |
+| `int` + `auto_increment` PK | `INT AUTO_INCREMENT` | `SERIAL` |
+| `str` + `max_length` | `VARCHAR(n)` | `VARCHAR(n)` |
+| `str` without `max_length` | `TEXT` | `TEXT` |
+| `bool` | `BOOL` | `BOOLEAN` |
+| `float` | `DOUBLE` | `DOUBLE PRECISION` |
+| `bytes` | `BLOB` | `BYTEA` |
+| `datetime.datetime` | `DATETIME` | `TIMESTAMP` |
+| `datetime.date` | `DATE` | `DATE` |
+| `decimal.Decimal` | `DECIMAL(18,6)` | `DECIMAL(18,6)` |
+| `dict` | `JSON` | `JSONB` |
+| `list` | `JSON` | `JSONB` |
+| `enum.Enum` subclass | `ENUM(...)` | Custom TYPE |
+
+## Connecting to Database
+
+```python
+from vorm.engine import create_mysql_engine, create_postgresql_engine
+
+# MySQL — MUST pass autocommit=True!
+engine = await create_mysql_engine(
+    host="127.0.0.1", port=3306, user="root",
+    password="pwd", database="test", minsize=10, maxsize=20,
+    autocommit=True,  # REQUIRED! Prevents stale reads and DDL blocking
+)
+session = engine.session()
+
+# PostgreSQL
+engine = await create_postgresql_engine(
+    host="127.0.0.1", port=5432, user="root",
+    password="pwd", database="test", min_size=50, max_size=100,
+)
+session = engine.session()
+
+# Cleanup
+await engine.close()
+```
+
+## DDL Sync (create table / add columns / add indexes)
+
+```python
+await Article.sync_table(session.dialect)
+# First run → CREATE TABLE IF NOT EXISTS + CREATE INDEX
+# Subsequent → ALTER TABLE ADD COLUMN / MODIFY COLUMN / CREATE INDEX
+# Never drops columns, tables, or indexes (additive only)
+```
+
+## CRUD
+
+```python
+# === INSERT ===
+article = Article(title="Hello", tags=["tech"])
+await session.insert(article)          # Always INSERT; auto-increment id auto-populated
+await session.bulk_insert([...])       # Batch insert
+
+# === save (convenience dispatcher) ===
+# PK is None → INSERT, otherwise → UPDATE (NOT an upsert)
+await session.save(article)
+
+# === SELECT ===
+await session.query(Article).all()                                          # All rows
+await session.query(Article).filter(Article.view_count >= 10).all()         # Filtered
+await session.query(Article).filter(Article.id == 1).one()                  # Exactly one (raises if not found)
+await session.query(Article).filter(Article.title.like("Hello%")).first()   # First or None
+await session.query(Article).count()                                        # Count
+await session.query(Article).filter(Article.id == 1).exists()               # Existence check
+await session.query(Article).order_by(col(Article.id).desc()).limit(10).offset(20).all()  # Pagination
+
+# === UPDATE ===
+article.view_count += 1
+await session.update(article)           # Updates by PK; PK must exist
+# Batch update
+await session.query(Article).filter(Article.view_count == 0).update(view_count=1)
+
+# === DELETE ===
+await session.delete(article)
+await session.query(Article).filter(Article.view_count == 0).delete()  # Batch
+```
+
+## Sorting
+
+```python
+from vorm import col
+
+# Wrap class-level fields with col() to call desc()/asc() (silences type-checker false positives)
+await session.query(Article).order_by(col(Article.id).desc()).all()
+await session.query(Article).order_by(col(Article.id).asc()).all()
+
+# Multi-field sorting
+await session.query(Article).order_by(
+    col(Article.view_count).desc(),
+    col(Article.id).asc(),
+).all()
+```
+
+## Advanced Queries
+
+```python
+# LIKE / BETWEEN
+await session.query(User).filter(col(User.name).like("A%")).all()
+await session.query(Book).filter(col(Book.price).between(10, 50)).all()
+
+# IN / IS NULL
+await session.query(User).filter(col(User.role).in_(["admin", "editor"])).all()
+await session.query(User).filter(col(User.email).is_null()).all()
+
+# AND / OR
+cond = (User.age >= 18) & (User.role == "member")       # AND
+cond = (User.role == "admin") | (User.role == "staff")   # OR
+
+# JSON path queries
+await session.query(Article).filter(col(Article.tags).json_path("$[0]") == "tech").all()
+await session.query(Product).filter(col(Product.data).json_path("$.price") > 100).all()
+```
+
+## Multi-table JOIN
+
+```python
+# INNER JOIN
+rows = await session.query(Author).join(
+    Book, on=Author.id == Book.author_id
+).filter(Book.price > 20).all()
+
+# LEFT JOIN
+rows = await session.query(Author).join(
+    Book, on=Author.id == Book.author_id, type="LEFT"
+).all()
+
+# Row access
+rows[0].authors.name     # Attribute access
+rows[0]["authors.id"]    # Dict key access
+dict(rows[0])            # Flat dict
+
+# select() for specific fields + alias() for renaming
+rows = await session.query(AllFieldTypes)\
+    .join(JoinTable, on=AllFieldTypes.id == JoinTable.all_id, type="left")\
+    .select(
+        AllFieldTypes.id,
+        AllFieldTypes.short_text,
+        JoinTable.short_text.alias("j_s_t"),
+    ).all()
+
+# Deserialize into Pydantic models
+from vorm.query import serialization
+result = serialization(MyPydanticModel, rows)
+```
+
+## Transactions
+
+```python
+# Basic transaction (auto-rollback on exception, auto-commit on success)
+async with session.transaction():
+    await session.save(alice)
+    await session.save(bob)
+
+# Nested transaction (inner uses SAVEPOINT automatically)
+async with session.transaction():
+    await session.save(alice)
+    try:
+        async with session.transaction():
+            await session.save(bob)
+            raise RuntimeError("roll back bob only")
+    except RuntimeError:
+        pass
+    # alice is still in the outer transaction
+```
+
+## Row Locking (FOR UPDATE)
+
+```python
+# Read-modify-write pattern (MUST be inside a transaction)
+async with session.transaction():
+    row = await session.query(Account)\
+        .filter(col(Account.id) == 1)\
+        .for_update()\
+        .first()
+    row.balance -= 100
+    await session.save(row)
+
+# SKIP LOCKED: concurrent task queue claiming
+async with session.transaction():
+    msg = await session.query(Message)\
+        .filter(Message.status == "pending")\
+        .order_by(col(Message.id))\
+        .limit(1)\
+        .for_update(skip_locked=True)\
+        .first()
+```
+
+- for_update() with skip_locked=True / nowait=True must be inside a transaction (raises RuntimeError otherwise)
+- Cannot be combined with count() / exists() / update() / delete() (raises ValueError)
+
+## Health Check & Reconnection
+
+```python
+# Background health monitor (recommended)
+asyncio.create_task(engine.health_monitor(interval=10))
+
+# Manual ping
+ok = await session.dialect.ping()
+
+# Manual reconnect
+ok = await engine.reconnect()                        # Default: 3 retries, 0.5s backoff
+ok = await engine.reconnect(retries=5, backoff=1.0)  # Custom
+# After successful reconnect, existing Sessions auto-switch to the new pool
+```
+
+## Raw SQL
+
+```python
+await session.execute_raw("DELETE FROM users WHERE status = %s", ["inactive"])
+rows = await session.fetch_raw("SELECT id, name FROM users WHERE age > %s", [18])
+row = await session.fetch_one_raw("SELECT * FROM users WHERE id = %s", [1])
+```
+
+- Placeholders: MySQL uses `%s`, PostgreSQL uses `$1, $2, ...`
+- Params must be a `list` (not tuple/dict)
+- fetch_raw() returns `list[dict]`, fetch_one_raw() returns `dict | None`
+- execute_raw() returns affected row count (int)
+- Raw SQL returns driver-native types (JSON columns are strings — use json.loads(); MySQL BOOL is int 0/1)
+
+## Logging
+
+```python
+import logging
+logging.getLogger("vorm").setLevel(logging.DEBUG)  # See all SQL
+```
+
+## Key Constraints
+
+1. All I/O is `async/await`
+2. SQL is always parameterized — never string-interpolate user input
+3. DDL is additive only — never drops anything
+4. MySQL connections MUST pass `autocommit=True`
+5. No FK / relationship features
+6. When the ORM doesn't support an operation (subqueries, window functions, UNION, complex aggregations, etc.), fall back to raw SQL (execute_raw / fetch_raw / fetch_one_raw)
+```
+
+</details>
+
 **Async ORM for Python 3.10+** — MySQL and PostgreSQL, built on Pydantic v2. Uses Pydantic models as the data layer, with additional field attributes for database column metadata, enabling DDL table structure management. This library prioritizes simplicity and does not provide foreign key, many-to-one, or many-to-many relationship features.
 
 ## Features

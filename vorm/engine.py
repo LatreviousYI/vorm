@@ -190,6 +190,7 @@ async def create_mysql_engine(
     pool_kwargs: dict[str, Any] = {"host": host, "port": port, "user": user, "password": password}
     if database is not None:
         pool_kwargs["db"] = database
+    pool_kwargs.setdefault("autocommit", True)
     pool_kwargs.update(kwargs)
     pool = await asyncmy.create_pool(**pool_kwargs)
 
